@@ -1,0 +1,4836 @@
+From 846245b5f5eb8f413203ebd3fec4ec821d54d328 Mon Sep 17 00:00:00 2001
+From: xqdoo00o <xqdoo00o@gmail.com>
+Date: Thu, 16 Jul 2020 00:41:49 +0800
+Subject: [PATCH 1/7] add support for wzAes zip
+
+---
+ .jshintignore                 |    1 +
+ lib/aesWorker.js              |   78 ++
+ lib/compressedObject.js       |   13 +-
+ lib/generate/ZipFileWorker.js |   93 +-
+ lib/generate/index.js         |   15 +-
+ lib/load.js                   |    1 +
+ lib/object.js                 |   98 +-
+ lib/sjcl.js                   | 1776 +++++++++++++++++++++++++++++++++
+ lib/zipEntries.js             |    4 +-
+ lib/zipEntry.js               |   50 +-
+ lib/zipObject.js              |   18 +
+ test/asserts/generate.js      |   35 +
+ test/asserts/load.js          |   23 +-
+ test/ref/aes.zip              |  Bin 0 -> 175 bytes
+ test/ref/aes_only_one.zip     |  Bin 0 -> 274 bytes
+ 15 files changed, 2134 insertions(+), 71 deletions(-)
+ create mode 100644 lib/aesWorker.js
+ create mode 100644 lib/sjcl.js
+ create mode 100644 test/ref/aes.zip
+ create mode 100644 test/ref/aes_only_one.zip
+
+diff --git a/.jshintignore b/.jshintignore
+index 3c3629e..aa78c23 100644
+--- a/.jshintignore
++++ b/.jshintignore
+@@ -1 +1,2 @@
+ node_modules
++lib/sjcl.js
+\ No newline at end of file
+diff --git a/lib/aesWorker.js b/lib/aesWorker.js
+new file mode 100644
+index 0000000..b83e3aa
+--- /dev/null
++++ b/lib/aesWorker.js
+@@ -0,0 +1,78 @@
++'use strict';
++var sjcl = require('./sjcl');
++
++/**
++ * A worker to handle aes zip file data.
++ * @param {String} action the process action name: either "Encrypt" or "Decrypt".
++ * @param {Object} options the options to use when (en/de)crypting.
++ */
++function AesWorker(action, options) {
++    this._crypto = sjcl;
++    this._aesAction = action;
++    this._password = options.password;
++    this._keyLen = 8 * options.strength + 8;
++    this._macLen = this._keyLen;
++    this._saltLen = this._keyLen / 2;
++    this._version = options.version;
++    this._passVerifyLen = 2;
++}
++
++/**
++ * Process(encrypt or decrypt) aes file data.
++ * @param {Uint8Array} data the data to process.
++ * @return {Uint8Array} the processed data.
++ */
++AesWorker.prototype.processData = function (data) {
++    var hmac;
++    var iv = [0, 0, 0, 0];
++
++    var salt = this._aesAction === "Encrypt" ?
++        this._crypto.random.randomWords(this._saltLen / 4) :
++        this._crypto.codec.bytes.toBits(data.slice(0, this._saltLen));
++    var derivedKey = this._crypto.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + this._passVerifyLen) * 8, this._crypto.misc.hmac);
++
++    var aesKey = this._crypto.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
++    var macKey = this._crypto.bitArray.bitSlice(derivedKey, this._keyLen * 8, (this._keyLen + this._macLen) * 8);
++    var derivedPassVerifier = this._crypto.bitArray.bitSlice(derivedKey, (this._keyLen + this._macLen) * 8);
++
++    if (this._aesAction === "Encrypt") {
++        var encryptedData = this._crypto.mode.ctrGladman.encrypt(new this._crypto.cipher.aes(aesKey), this._crypto.codec.bytes.toBits(data), iv);
++        encryptedData = this._crypto.bitArray.clamp(encryptedData, (data.length) * 8);
++
++        hmac = new this._crypto.misc.hmac(macKey);
++        var macData = hmac.encrypt(encryptedData);
++        macData = this._crypto.bitArray.clamp(macData, 10 * 8);
++
++        var fileData = this._crypto.bitArray.concat(salt, derivedPassVerifier);
++        fileData = this._crypto.bitArray.concat(fileData, encryptedData);
++        fileData = this._crypto.bitArray.concat(fileData, macData);
++        return Uint8Array.from(this._crypto.codec.bytes.fromBits(fileData));
++    } else {
++        var passVerifyValue = this._crypto.codec.bytes.toBits(data.slice(this._saltLen, this._saltLen + this._passVerifyLen));
++        if (!this._crypto.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
++            throw new Error("Encrypted zip: incorrect password");
++        }
++
++        var encryptedValue = this._crypto.codec.bytes.toBits(data.slice(this._saltLen + this._passVerifyLen, -10));
++        var macValue = this._crypto.codec.bytes.toBits(data.slice(-10));
++        // if AE-2 format check mac
++        if (this._version === 2) {
++            hmac = new this._crypto.misc.hmac(macKey);
++            var macVerifier = hmac.encrypt(encryptedValue);
++            macVerifier = this._crypto.bitArray.clamp(macVerifier, 10 * 8);
++            if (!this._crypto.bitArray.equal(macValue, macVerifier)) {
++                throw new Error("Corrupted zip: CRC failed");
++            }
++        }
++
++        var decryptData = this._crypto.mode.ctrGladman.decrypt(new this._crypto.cipher.aes(aesKey), encryptedValue, iv);
++        return Uint8Array.from(this._crypto.codec.bytes.fromBits(decryptData));
++    }
++};
++
++exports.encryptWorker = function (encryptOptions) {
++    return new AesWorker("Encrypt", encryptOptions);
++};
++exports.decryptWorker = function (decryptOptions) {
++    return new AesWorker("Decrypt", decryptOptions);
++};
+\ No newline at end of file
+diff --git a/lib/compressedObject.js b/lib/compressedObject.js
+index d4a7f5e..b1e6748 100644
+--- a/lib/compressedObject.js
++++ b/lib/compressedObject.js
+@@ -5,6 +5,7 @@ var DataWorker = require('./stream/DataWorker');
+ var DataLengthProbe = require('./stream/DataLengthProbe');
+ var Crc32Probe = require('./stream/Crc32Probe');
+ var DataLengthProbe = require('./stream/DataLengthProbe');
++var aesWorker = require('./aesWorker');
+ 
+ /**
+  * Represent a compressed object, with everything needed to decompress it.
+@@ -12,15 +13,17 @@ var DataLengthProbe = require('./stream/DataLengthProbe');
+  * @param {number} compressedSize the size of the data compressed.
+  * @param {number} uncompressedSize the size of the data after decompression.
+  * @param {number} crc32 the crc32 of the decompressed file.
+- * @param {object} compression the type of compression, see lib/compressions.js.
++ * @param {Object} compression the type of compression, see lib/compressions.js.
+  * @param {String|ArrayBuffer|Uint8Array|Buffer} data the compressed data.
++ * @param {Object} decryptOptions the compressed object decrypt options.
+  */
+-function CompressedObject(compressedSize, uncompressedSize, crc32, compression, data) {
++function CompressedObject(compressedSize, uncompressedSize, crc32, compression, data, decryptOptions) {
+     this.compressedSize = compressedSize;
+     this.uncompressedSize = uncompressedSize;
+     this.crc32 = crc32;
+     this.compression = compression;
+     this.compressedContent = data;
++    this.decryptOptions = decryptOptions;
+ }
+ 
+ CompressedObject.prototype = {
+@@ -29,6 +32,12 @@ CompressedObject.prototype = {
+      * @return {GenericWorker} the worker.
+      */
+     getContentWorker : function () {
++        if (this.decryptOptions) {
++            if (!(this.decryptOptions.password && typeof this.decryptOptions.password === "string" )) {
++                throw new Error("Encrypted zip: need password");
++            }
++            this.compressedContent = aesWorker.decryptWorker(this.decryptOptions).processData(this.compressedContent);
++        }
+         var worker = new DataWorker(external.Promise.resolve(this.compressedContent))
+         .pipe(this.compression.uncompressWorker())
+         .pipe(new DataLengthProbe("data_length"));
+diff --git a/lib/generate/ZipFileWorker.js b/lib/generate/ZipFileWorker.js
+index 4c7a611..061ea6e 100644
+--- a/lib/generate/ZipFileWorker.js
++++ b/lib/generate/ZipFileWorker.js
+@@ -5,6 +5,7 @@ var GenericWorker = require('../stream/GenericWorker');
+ var utf8 = require('../utf8');
+ var crc32 = require('../crc32');
+ var signature = require('../signature');
++var aesWorker = require('../aesWorker');
+ 
+ /**
+  * Transform an integer into a string in hexadecimal.
+@@ -95,7 +96,9 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
+     unicodePathExtraField = "",
+     unicodeCommentExtraField = "",
+     dir = file.dir,
+-    date = file.date;
++    date = file.date,
++    encryptOptions = streamInfo.file.encryptOptions,
++    isEncrypt = encryptOptions.password !== null;
+ 
+ 
+     var dataInfo = {
+@@ -113,6 +116,9 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
+     }
+ 
+     var bitflag = 0;
++    if (isEncrypt) {
++        bitflag |= 0x0001;
++    }
+     if (streamedContent) {
+         // Bit 3: the sizes/crc32 are set to zero in the local header.
+         // The correct values are put in the data descriptor immediately
+@@ -131,7 +137,7 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
+         // dos or unix, we set the dos dir flag
+         extFileAttr |= 0x00010;
+     }
+-    if(platform === "UNIX") {
++    if (platform === "UNIX") {
+         versionMadeBy = 0x031E; // UNIX, version 3.0
+         extFileAttr |= generateUnixExternalFileAttr(file.unixPermissions, dir);
+     } else { // DOS or other, fallback to DOS
+@@ -183,7 +189,7 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
+             unicodePathExtraField;
+     }
+ 
+-    if(useUTF8ForComment) {
++    if (useUTF8ForComment) {
+ 
+         unicodeCommentExtraField =
+             // Version
+@@ -202,14 +208,31 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
+             unicodeCommentExtraField;
+     }
+ 
++    if (isEncrypt) {
++        extraFields += "\x01" + String.fromCharCode(0x99);
++        extraFields += "\x07\x00";
++        extraFields += "\x02\x00";
++        extraFields += "AE";
++        extraFields += String.fromCharCode(encryptOptions.strength);
++        extraFields += compression.magic;
++    }
++
+     var header = "";
+ 
+     // version needed to extract
+-    header += "\x0A\x00";
++    if (isEncrypt) {
++        header += "\x33\x00";
++    } else {
++        header += "\x0A\x00";
++    }
+     // general purpose bit flag
+     header += decToHex(bitflag, 2);
+     // compression method
+-    header += compression.magic;
++    if (isEncrypt) {
++        header += "\x63\x00";
++    } else {
++        header += compression.magic;
++    }
+     // last mod file time
+     header += decToHex(dosTime, 2);
+     // last mod file date
+@@ -347,8 +370,8 @@ function ZipFileWorker(streamFiles, comment, platform, encodeFileName) {
+     // the name of the file currently being added, null when handling the end of the zip file.
+     // Used for the emitted metadata.
+     this.currentFile = null;
+-
+-
++    // The chunk tmp array if streamFiles and encryption in options.
++    this.chunkTmp = [];
+ 
+     this._sources = [];
+ }
+@@ -363,9 +386,19 @@ ZipFileWorker.prototype.push = function (chunk) {
+     var entriesCount = this.entriesCount;
+     var remainingFiles = this._sources.length;
+ 
+-    if(this.accumulate) {
++    if (this.accumulate) {
+         this.contentBuffer.push(chunk);
+     } else {
++        if (this.streamFiles && this.previous.streamInfo.file.encryptOptions.password !== null && chunk.data instanceof Uint8Array) {
++            this.chunkTmp.push(chunk);
++            if (chunk.meta.percent !== 100) {
++                return;
++            }
++            var content = this.encryptContent(this.chunkTmp, this.previous.streamInfo.compressedSize, this.previous.streamInfo.file.encryptOptions);
++            this.previous.streamInfo.compressedSize = content.length;
++            chunk.data = content;
++        }
++
+         this.bytesWritten += chunk.data.length;
+ 
+         GenericWorker.prototype.push.call(this, {
+@@ -378,6 +411,27 @@ ZipFileWorker.prototype.push = function (chunk) {
+     }
+ };
+ 
++/**
++ * Encrypt data after compression.
++ * @param {Array} contents the chunk file data array.
++ * @param {Number} size the file data total length.
++ * @param {Object} options encrypt options.
++ */
++ZipFileWorker.prototype.encryptContent = function (contents, size, options) {
++    //the file which size small than 16384B no need new Uint8Array.
++    if (contents.length === 1) {
++        return aesWorker.encryptWorker(options).processData(contents.shift().data);
++    }
++    var content = new Uint8Array(size);
++    var offset = 0;
++    while (contents.length) {
++        var buffer = contents.shift();
++        content.set(buffer.data, offset);
++        offset += buffer.data.length;
++    }
++    return aesWorker.encryptWorker(options).processData(content);
++};
++
+ /**
+  * The worker started a new source (an other worker).
+  * @param {Object} streamInfo the streamInfo object from the new source.
+@@ -408,10 +462,29 @@ ZipFileWorker.prototype.openedSource = function (streamInfo) {
+ ZipFileWorker.prototype.closedSource = function (streamInfo) {
+     this.accumulate = false;
+     var streamedContent = this.streamFiles && !streamInfo['file'].dir;
+-    var record = generateZipParts(streamInfo, streamedContent, true, this.currentSourceOffset, this.zipPlatform, this.encodeFileName);
++    if (streamInfo.file.encryptOptions.password !== null && !streamInfo['file'].dir) {
++        if (!this.streamFiles) {
++            var content = this.encryptContent(this.contentBuffer, streamInfo.compressedSize, streamInfo.file.encryptOptions);
++            streamInfo.compressedSize = content.length;
++            this.contentBuffer.push({
++                data: content,
++                meta: {
++                    percent: 100
++                }
++            });
++        } else if (streamInfo.uncompressedSize === 0) {
++            this.push({
++                data: new Uint8Array(),
++                meta: {
++                    percent: 100
++                }
++            });
++        }
++    }
+ 
++    var record = generateZipParts(streamInfo, streamedContent, true, this.currentSourceOffset, this.zipPlatform, this.encodeFileName);
+     this.dirRecords.push(record.dirRecord);
+-    if(streamedContent) {
++    if (streamedContent) {
+         // after the streamed file, we put data descriptors
+         this.push({
+             data : generateDataDescriptors(streamInfo),
+diff --git a/lib/generate/index.js b/lib/generate/index.js
+index 083ddeb..39884dc 100644
+--- a/lib/generate/index.js
++++ b/lib/generate/index.js
+@@ -2,6 +2,7 @@
+ 
+ var compressions = require('../compressions');
+ var ZipFileWorker = require('./ZipFileWorker');
++var utils = require('../utils');
+ 
+ /**
+  * Find the compression to use.
+@@ -26,7 +27,10 @@ var getCompression = function (fileCompression, zipCompression) {
+  * @param {String} comment the comment to use.
+  */
+ exports.generateWorker = function (zip, options, comment) {
+-
++    var encryptOptions = {
++        password: options.password,
++        strength: options.encryptStrength
++    };
+     var zipFileWorker = new ZipFileWorker(options.streamFiles, comment, options.platform, options.encodeFileName);
+     var entriesCount = 0;
+     try {
+@@ -36,6 +40,12 @@ exports.generateWorker = function (zip, options, comment) {
+             var compression = getCompression(file.options.compression, options.compression);
+             var compressionOptions = file.options.compressionOptions || options.compressionOptions || {};
+             var dir = file.dir, date = file.date;
++            var fileEncryptOptions = utils.extend(file.encryptOptions || {}, encryptOptions);
++            if (!fileEncryptOptions.password) {
++                fileEncryptOptions.password = null;
++            } else if (typeof fileEncryptOptions.password !== "string") {
++                throw new Error("Password is not a valid string.");
++            }
+ 
+             file._compressWorker(compression, compressionOptions)
+             .withStreamInfo("file", {
+@@ -44,7 +54,8 @@ exports.generateWorker = function (zip, options, comment) {
+                 date : date,
+                 comment : file.comment || "",
+                 unixPermissions : file.unixPermissions,
+-                dosPermissions : file.dosPermissions
++                dosPermissions : file.dosPermissions,
++                encryptOptions : fileEncryptOptions
+             })
+             .pipe(zipFileWorker);
+         });
+diff --git a/lib/load.js b/lib/load.js
+index 53cae42..2974086 100644
+--- a/lib/load.js
++++ b/lib/load.js
+@@ -33,6 +33,7 @@ module.exports = function(data, options) {
+     var zip = this;
+     options = utils.extend(options || {}, {
+         base64: false,
++        password: null,
+         checkCRC32: false,
+         optimizedBinaryString: false,
+         createFolders: false,
+diff --git a/lib/object.js b/lib/object.js
+index 1c9d8e8..6b585ce 100644
+--- a/lib/object.js
++++ b/lib/object.js
+@@ -318,54 +318,56 @@ var out = {
+      * - type, "base64" by default. Values are : string, base64, uint8array, arraybuffer, blob.
+      * @return {StreamHelper} the streamed zip file.
+      */
+-    generateInternalStream: function(options) {
+-      var worker, opts = {};
+-      try {
+-          opts = utils.extend(options || {}, {
+-              streamFiles: false,
+-              compression: "STORE",
+-              compressionOptions : null,
+-              type: "",
+-              platform: "DOS",
+-              comment: null,
+-              mimeType: 'application/zip',
+-              encodeFileName: utf8.utf8encode
+-          });
+-
+-          opts.type = opts.type.toLowerCase();
+-          opts.compression = opts.compression.toUpperCase();
+-
+-          // "binarystring" is preferred but the internals use "string".
+-          if(opts.type === "binarystring") {
+-            opts.type = "string";
+-          }
+-
+-          if (!opts.type) {
+-            throw new Error("No output type specified.");
+-          }
+-
+-          utils.checkSupport(opts.type);
+-
+-          // accept nodejs `process.platform`
+-          if(
+-              opts.platform === 'darwin' ||
+-              opts.platform === 'freebsd' ||
+-              opts.platform === 'linux' ||
+-              opts.platform === 'sunos'
+-          ) {
+-              opts.platform = "UNIX";
+-          }
+-          if (opts.platform === 'win32') {
+-              opts.platform = "DOS";
+-          }
+-
+-          var comment = opts.comment || this.comment || "";
+-          worker = generate.generateWorker(this, opts, comment);
+-      } catch (e) {
+-        worker = new GenericWorker("error");
+-        worker.error(e);
+-      }
+-      return new StreamHelper(worker, opts.type || "string", opts.mimeType);
++    generateInternalStream: function (options) {
++        var worker, opts = {};
++        try {
++            opts = utils.extend(options || {}, {
++                streamFiles: false,
++                compression: "STORE",
++                compressionOptions: null,
++                password: null,
++                encryptStrength: 3,
++                type: "",
++                platform: "DOS",
++                comment: null,
++                mimeType: 'application/zip',
++                encodeFileName: utf8.utf8encode
++            });
++
++            opts.type = opts.type.toLowerCase();
++            opts.compression = opts.compression.toUpperCase();
++
++            // "binarystring" is preferred but the internals use "string".
++            if (opts.type === "binarystring") {
++                opts.type = "string";
++            }
++
++            if (!opts.type) {
++                throw new Error("No output type specified.");
++            }
++
++            utils.checkSupport(opts.type);
++
++            // accept nodejs `process.platform`
++            if (
++                opts.platform === 'darwin' ||
++                opts.platform === 'freebsd' ||
++                opts.platform === 'linux' ||
++                opts.platform === 'sunos'
++            ) {
++                opts.platform = "UNIX";
++            }
++            if (opts.platform === 'win32') {
++                opts.platform = "DOS";
++            }
++
++            var comment = opts.comment || this.comment || "";
++            worker = generate.generateWorker(this, opts, comment);
++        } catch (e) {
++            worker = new GenericWorker("error");
++            worker.error(e);
++        }
++        return new StreamHelper(worker, opts.type || "string", opts.mimeType);
+     },
+     /**
+      * Generate the complete zip file asynchronously.
+diff --git a/lib/sjcl.js b/lib/sjcl.js
+new file mode 100644
+index 0000000..e5b7f5e
+--- /dev/null
++++ b/lib/sjcl.js
+@@ -0,0 +1,1776 @@
++/** @fileOverview Javascript cryptography implementation.
++ *
++ * Crush to remove comments, shorten variable names and
++ * generally reduce transmission size.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++"use strict";
++/*jslint indent: 2, bitwise: false, nomen: false, plusplus: false, white: false, regexp: false */
++/*global document, window, escape, unescape, module, require, Uint32Array */
++
++/**
++ * The Stanford Javascript Crypto Library, top-level namespace.
++ * @namespace
++ */
++var sjcl = {
++    /**
++     * Symmetric ciphers.
++     * @namespace
++     */
++    cipher: {},
++
++    /**
++     * Hash functions.  Right now only SHA256 is implemented.
++     * @namespace
++     */
++    hash: {},
++
++    /**
++     * Key exchange functions.  Right now only SRP is implemented.
++     * @namespace
++     */
++    keyexchange: {},
++
++    /**
++     * Cipher modes of operation.
++     * @namespace
++     */
++    mode: {},
++
++    /**
++     * Miscellaneous.  HMAC and PBKDF2.
++     * @namespace
++     */
++    misc: {},
++
++    /**
++     * Bit array encoders and decoders.
++     * @namespace
++     *
++     * @description
++     * The members of this namespace are functions which translate between
++     * SJCL's bitArrays and other objects (usually strings).  Because it
++     * isn't always clear which direction is encoding and which is decoding,
++     * the method names are "fromBits" and "toBits".
++     */
++    codec: {},
++
++    /**
++     * Exceptions.
++     * @namespace
++     */
++    exception: {
++        /**
++         * Ciphertext is corrupt.
++         * @constructor
++         */
++        corrupt: function (message) {
++            this.toString = function () { return "CORRUPT: " + this.message; };
++            this.message = message;
++        },
++
++        /**
++         * Invalid parameter.
++         * @constructor
++         */
++        invalid: function (message) {
++            this.toString = function () { return "INVALID: " + this.message; };
++            this.message = message;
++        },
++
++        /**
++         * Bug or missing feature in SJCL.
++         * @constructor
++         */
++        bug: function (message) {
++            this.toString = function () { return "BUG: " + this.message; };
++            this.message = message;
++        },
++
++        /**
++         * Something isn't ready.
++         * @constructor
++         */
++        notReady: function (message) {
++            this.toString = function () { return "NOT READY: " + this.message; };
++            this.message = message;
++        }
++    }
++};
++
++/** @fileOverview Arrays of bits, encoded as arrays of Numbers.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/**
++ * Arrays of bits, encoded as arrays of Numbers.
++ * @namespace
++ * @description
++ * <p>
++ * These objects are the currency accepted by SJCL's crypto functions.
++ * </p>
++ *
++ * <p>
++ * Most of our crypto primitives operate on arrays of 4-byte words internally,
++ * but many of them can take arguments that are not a multiple of 4 bytes.
++ * This library encodes arrays of bits (whose size need not be a multiple of 8
++ * bits) as arrays of 32-bit words.  The bits are packed, big-endian, into an
++ * array of words, 32 bits at a time.  Since the words are double-precision
++ * floating point numbers, they fit some extra data.  We use this (in a private,
++ * possibly-changing manner) to encode the number of bits actually  present
++ * in the last word of the array.
++ * </p>
++ *
++ * <p>
++ * Because bitwise ops clear this out-of-band data, these arrays can be passed
++ * to ciphers like AES which want arrays of words.
++ * </p>
++ */
++sjcl.bitArray = {
++    /**
++     * Array slices in units of bits.
++     * @param {bitArray} a The array to slice.
++     * @param {Number} bstart The offset to the start of the slice, in bits.
++     * @param {Number} bend The offset to the end of the slice, in bits.  If this is undefined,
++     * slice until the end of the array.
++     * @return {bitArray} The requested slice.
++     */
++    bitSlice: function (a, bstart, bend) {
++        a = sjcl.bitArray._shiftRight(a.slice(bstart / 32), 32 - (bstart & 31)).slice(1);
++        return (bend === undefined) ? a : sjcl.bitArray.clamp(a, bend - bstart);
++    },
++
++    /**
++     * Extract a number packed into a bit array.
++     * @param {bitArray} a The array to slice.
++     * @param {Number} bstart The offset to the start of the slice, in bits.
++     * @param {Number} blength The length of the number to extract.
++     * @return {Number} The requested slice.
++     */
++    extract: function (a, bstart, blength) {
++        // FIXME: this Math.floor is not necessary at all, but for some reason
++        // seems to suppress a bug in the Chromium JIT.
++        var x, sh = Math.floor((-bstart - blength) & 31);
++        if ((bstart + blength - 1 ^ bstart) & -32) {
++            // it crosses a boundary
++            x = (a[bstart / 32 | 0] << (32 - sh)) ^ (a[bstart / 32 + 1 | 0] >>> sh);
++        } else {
++            // within a single word
++            x = a[bstart / 32 | 0] >>> sh;
++        }
++        return x & ((1 << blength) - 1);
++    },
++
++    /**
++     * Concatenate two bit arrays.
++     * @param {bitArray} a1 The first array.
++     * @param {bitArray} a2 The second array.
++     * @return {bitArray} The concatenation of a1 and a2.
++     */
++    concat: function (a1, a2) {
++        if (a1.length === 0 || a2.length === 0) {
++            return a1.concat(a2);
++        }
++
++        var last = a1[a1.length - 1], shift = sjcl.bitArray.getPartial(last);
++        if (shift === 32) {
++            return a1.concat(a2);
++        } else {
++            return sjcl.bitArray._shiftRight(a2, shift, last | 0, a1.slice(0, a1.length - 1));
++        }
++    },
++
++    /**
++     * Find the length of an array of bits.
++     * @param {bitArray} a The array.
++     * @return {Number} The length of a, in bits.
++     */
++    bitLength: function (a) {
++        var l = a.length, x;
++        if (l === 0) { return 0; }
++        x = a[l - 1];
++        return (l - 1) * 32 + sjcl.bitArray.getPartial(x);
++    },
++
++    /**
++     * Truncate an array.
++     * @param {bitArray} a The array.
++     * @param {Number} len The length to truncate to, in bits.
++     * @return {bitArray} A new array, truncated to len bits.
++     */
++    clamp: function (a, len) {
++        if (a.length * 32 < len) { return a; }
++        a = a.slice(0, Math.ceil(len / 32));
++        var l = a.length;
++        len = len & 31;
++        if (l > 0 && len) {
++            a[l - 1] = sjcl.bitArray.partial(len, a[l - 1] & 0x80000000 >> (len - 1), 1);
++        }
++        return a;
++    },
++
++    /**
++     * Make a partial word for a bit array.
++     * @param {Number} len The number of bits in the word.
++     * @param {Number} x The bits.
++     * @param {Number} [_end=0] Pass 1 if x has already been shifted to the high side.
++     * @return {Number} The partial word.
++     */
++    partial: function (len, x, _end) {
++        if (len === 32) { return x; }
++        return (_end ? x | 0 : x << (32 - len)) + len * 0x10000000000;
++    },
++
++    /**
++     * Get the number of bits used by a partial word.
++     * @param {Number} x The partial word.
++     * @return {Number} The number of bits used by the partial word.
++     */
++    getPartial: function (x) {
++        return Math.round(x / 0x10000000000) || 32;
++    },
++
++    /**
++     * Compare two arrays for equality in a predictable amount of time.
++     * @param {bitArray} a The first array.
++     * @param {bitArray} b The second array.
++     * @return {boolean} true if a == b; false otherwise.
++     */
++    equal: function (a, b) {
++        if (sjcl.bitArray.bitLength(a) !== sjcl.bitArray.bitLength(b)) {
++            return false;
++        }
++        var x = 0, i;
++        for (i = 0; i < a.length; i++) {
++            x |= a[i] ^ b[i];
++        }
++        return (x === 0);
++    },
++
++    /** Shift an array right.
++     * @param {bitArray} a The array to shift.
++     * @param {Number} shift The number of bits to shift.
++     * @param {Number} [carry=0] A byte to carry in
++     * @param {bitArray} [out=[]] An array to prepend to the output.
++     * @private
++     */
++    _shiftRight: function (a, shift, carry, out) {
++        var i, last2 = 0, shift2;
++        if (out === undefined) { out = []; }
++
++        for (; shift >= 32; shift -= 32) {
++            out.push(carry);
++            carry = 0;
++        }
++        if (shift === 0) {
++            return out.concat(a);
++        }
++
++        for (i = 0; i < a.length; i++) {
++            out.push(carry | a[i] >>> shift);
++            carry = a[i] << (32 - shift);
++        }
++        last2 = a.length ? a[a.length - 1] : 0;
++        shift2 = sjcl.bitArray.getPartial(last2);
++        out.push(sjcl.bitArray.partial(shift + shift2 & 31, (shift + shift2 > 32) ? carry : out.pop(), 1));
++        return out;
++    },
++
++    /** xor a block of 4 words together.
++     * @private
++     */
++    _xor4: function (x, y) {
++        return [x[0] ^ y[0], x[1] ^ y[1], x[2] ^ y[2], x[3] ^ y[3]];
++    },
++
++    /** byteswap a word array inplace.
++     * (does not handle partial words)
++     * @param {sjcl.bitArray} a word array
++     * @return {sjcl.bitArray} byteswapped array
++     */
++    byteswapM: function (a) {
++        var i, v, m = 0xff00;
++        for (i = 0; i < a.length; ++i) {
++            v = a[i];
++            a[i] = (v >>> 24) | ((v >>> 8) & m) | ((v & m) << 8) | (v << 24);
++        }
++        return a;
++    }
++};
++
++/** @fileOverview Bit array codec implementations.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/**
++ * Arrays of bytes
++ * @namespace
++ */
++sjcl.codec.bytes = {
++    /** Convert from a bitArray to an array of bytes. */
++    fromBits: function (arr) {
++        var out = [], bl = sjcl.bitArray.bitLength(arr), i, tmp;
++        for (i = 0; i < bl / 8; i++) {
++            if ((i & 3) === 0) {
++                tmp = arr[i / 4];
++            }
++            out.push(tmp >>> 24);
++            tmp <<= 8;
++        }
++        return out;
++    },
++    /** Convert from an array of bytes to a bitArray. */
++    toBits: function (bytes) {
++        var out = [], i, tmp = 0;
++        for (i = 0; i < bytes.length; i++) {
++            tmp = tmp << 8 | bytes[i];
++            if ((i & 3) === 3) {
++                out.push(tmp);
++                tmp = 0;
++            }
++        }
++        if (i & 3) {
++            out.push(sjcl.bitArray.partial(8 * (i & 3), tmp));
++        }
++        return out;
++    }
++};
++
++/** @fileOverview Bit array codec implementations.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/**
++ * UTF-8 strings
++ * @namespace
++ */
++sjcl.codec.utf8String = {
++    /** Convert from a bitArray to a UTF-8 string. */
++    fromBits: function (arr) {
++        var out = "", bl = sjcl.bitArray.bitLength(arr), i, tmp;
++        for (i = 0; i < bl / 8; i++) {
++            if ((i & 3) === 0) {
++                tmp = arr[i / 4];
++            }
++            out += String.fromCharCode(tmp >>> 8 >>> 8 >>> 8);
++            tmp <<= 8;
++        }
++        return decodeURIComponent(escape(out));
++    },
++
++    /** Convert from a UTF-8 string to a bitArray. */
++    toBits: function (str) {
++        str = unescape(encodeURIComponent(str));
++        var out = [], i, tmp = 0;
++        for (i = 0; i < str.length; i++) {
++            tmp = tmp << 8 | str.charCodeAt(i);
++            if ((i & 3) === 3) {
++                out.push(tmp);
++                tmp = 0;
++            }
++        }
++        if (i & 3) {
++            out.push(sjcl.bitArray.partial(8 * (i & 3), tmp));
++        }
++        return out;
++    }
++};
++
++/** @fileOverview Javascript SHA-1 implementation.
++ *
++ * Based on the implementation in RFC 3174, method 1, and on the SJCL
++ * SHA-256 implementation.
++ *
++ * @author Quinn Slack
++ */
++
++/**
++ * Context for a SHA-1 operation in progress.
++ * @constructor
++ */
++sjcl.hash.sha1 = function (hash) {
++    if (hash) {
++        this._h = hash._h.slice(0);
++        this._buffer = hash._buffer.slice(0);
++        this._length = hash._length;
++    } else {
++        this.reset();
++    }
++};
++
++/**
++ * Hash a string or an array of words.
++ * @static
++ * @param {bitArray|String} data the data to hash.
++ * @return {bitArray} The hash value, an array of 5 big-endian words.
++ */
++sjcl.hash.sha1.hash = function (data) {
++    return (new sjcl.hash.sha1()).update(data).finalize();
++};
++
++sjcl.hash.sha1.prototype = {
++    /**
++     * The hash's block size, in bits.
++     * @constant
++     */
++    blockSize: 512,
++
++    /**
++     * Reset the hash state.
++     * @return this
++     */
++    reset: function () {
++        this._h = this._init.slice(0);
++        this._buffer = [];
++        this._length = 0;
++        return this;
++    },
++
++    /**
++     * Input several words to the hash.
++     * @param {bitArray|String} data the data to hash.
++     * @return this
++     */
++    update: function (data) {
++        if (typeof data === "string") {
++            data = sjcl.codec.utf8String.toBits(data);
++        }
++        var i, b = this._buffer = sjcl.bitArray.concat(this._buffer, data),
++            ol = this._length,
++            nl = this._length = ol + sjcl.bitArray.bitLength(data);
++        if (nl > 9007199254740991) {
++            throw new sjcl.exception.invalid("Cannot hash more than 2^53 - 1 bits");
++        }
++
++        if (typeof Uint32Array !== 'undefined') {
++            var c = new Uint32Array(b);
++            var j = 0;
++            for (i = this.blockSize + ol - ((this.blockSize + ol) & (this.blockSize - 1)); i <= nl;
++                i += this.blockSize) {
++                this._block(c.subarray(16 * j, 16 * (j + 1)));
++                j += 1;
++            }
++            b.splice(0, 16 * j);
++        } else {
++            for (i = this.blockSize + ol - ((this.blockSize + ol) & (this.blockSize - 1)); i <= nl;
++                i += this.blockSize) {
++                this._block(b.splice(0, 16));
++            }
++        }
++        return this;
++    },
++
++    /**
++     * Complete hashing and output the hash value.
++     * @return {bitArray} The hash value, an array of 5 big-endian words. TODO
++     */
++    finalize: function () {
++        var i, b = this._buffer, h = this._h;
++
++        // Round out and push the buffer
++        b = sjcl.bitArray.concat(b, [sjcl.bitArray.partial(1, 1)]);
++        // Round out the buffer to a multiple of 16 words, less the 2 length words.
++        for (i = b.length + 2; i & 15; i++) {
++            b.push(0);
++        }
++
++        // append the length
++        b.push(Math.floor(this._length / 0x100000000));
++        b.push(this._length | 0);
++
++        while (b.length) {
++            this._block(b.splice(0, 16));
++        }
++
++        this.reset();
++        return h;
++    },
++
++    /**
++     * The SHA-1 initialization vector.
++     * @private
++     */
++    _init: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
++
++    /**
++     * The SHA-1 hash key.
++     * @private
++     */
++    _key: [0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6],
++
++    /**
++     * The SHA-1 logical functions f(0), f(1), ..., f(79).
++     * @private
++     */
++    _f: function (t, b, c, d) {
++        if (t <= 19) {
++            return (b & c) | (~b & d);
++        } else if (t <= 39) {
++            return b ^ c ^ d;
++        } else if (t <= 59) {
++            return (b & c) | (b & d) | (c & d);
++        } else if (t <= 79) {
++            return b ^ c ^ d;
++        }
++    },
++
++    /**
++     * Circular left-shift operator.
++     * @private
++     */
++    _S: function (n, x) {
++        return (x << n) | (x >>> 32 - n);
++    },
++
++    /**
++     * Perform one cycle of SHA-1.
++     * @param {Uint32Array|bitArray} words one block of words.
++     * @private
++     */
++    _block: function (words) {
++        var t, tmp, a, b, c, d, e,
++            h = this._h;
++        var w;
++        if (typeof Uint32Array !== 'undefined') {
++            // When words is passed to _block, it has 16 elements. SHA1 _block
++            // function extends words with new elements (at the end there are 80 elements). 
++            // The problem is that if we use Uint32Array instead of Array, 
++            // the length of Uint32Array cannot be changed. Thus, we replace words with a 
++            // normal Array here.
++            w = Array(80); // do not use Uint32Array here as the instantiation is slower
++            for (var j = 0; j < 16; j++) {
++                w[j] = words[j];
++            }
++        } else {
++            w = words;
++        }
++
++        a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4];
++
++        for (t = 0; t <= 79; t++) {
++            if (t >= 16) {
++                w[t] = this._S(1, w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]);
++            }
++            tmp = (this._S(5, a) + this._f(t, b, c, d) + e + w[t] +
++                this._key[Math.floor(t / 20)]) | 0;
++            e = d;
++            d = c;
++            c = this._S(30, b);
++            b = a;
++            a = tmp;
++        }
++
++        h[0] = (h[0] + a) | 0;
++        h[1] = (h[1] + b) | 0;
++        h[2] = (h[2] + c) | 0;
++        h[3] = (h[3] + d) | 0;
++        h[4] = (h[4] + e) | 0;
++    }
++};
++
++/** @fileOverview Javascript SHA-256 implementation.
++ *
++ * An older version of this implementation is available in the public
++ * domain, but this one is (c) Emily Stark, Mike Hamburg, Dan Boneh,
++ * Stanford University 2008-2010 and BSD-licensed for liability
++ * reasons.
++ *
++ * Special thanks to Aldo Cortesi for pointing out several bugs in
++ * this code.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/**
++ * Context for a SHA-256 operation in progress.
++ * @constructor
++ */
++sjcl.hash.sha256 = function (hash) {
++    if (!this._key[0]) { this._precompute(); }
++    if (hash) {
++        this._h = hash._h.slice(0);
++        this._buffer = hash._buffer.slice(0);
++        this._length = hash._length;
++    } else {
++        this.reset();
++    }
++};
++
++/**
++ * Hash a string or an array of words.
++ * @static
++ * @param {bitArray|String} data the data to hash.
++ * @return {bitArray} The hash value, an array of 16 big-endian words.
++ */
++sjcl.hash.sha256.hash = function (data) {
++    return (new sjcl.hash.sha256()).update(data).finalize();
++};
++
++sjcl.hash.sha256.prototype = {
++    /**
++     * The hash's block size, in bits.
++     * @constant
++     */
++    blockSize: 512,
++
++    /**
++     * Reset the hash state.
++     * @return this
++     */
++    reset: function () {
++        this._h = this._init.slice(0);
++        this._buffer = [];
++        this._length = 0;
++        return this;
++    },
++
++    /**
++     * Input several words to the hash.
++     * @param {bitArray|String} data the data to hash.
++     * @return this
++     */
++    update: function (data) {
++        if (typeof data === "string") {
++            data = sjcl.codec.utf8String.toBits(data);
++        }
++        var i, b = this._buffer = sjcl.bitArray.concat(this._buffer, data),
++            ol = this._length,
++            nl = this._length = ol + sjcl.bitArray.bitLength(data);
++        if (nl > 9007199254740991) {
++            throw new sjcl.exception.invalid("Cannot hash more than 2^53 - 1 bits");
++        }
++
++        if (typeof Uint32Array !== 'undefined') {
++            var c = new Uint32Array(b);
++            var j = 0;
++            for (i = 512 + ol - ((512 + ol) & 511); i <= nl; i += 512) {
++                this._block(c.subarray(16 * j, 16 * (j + 1)));
++                j += 1;
++            }
++            b.splice(0, 16 * j);
++        } else {
++            for (i = 512 + ol - ((512 + ol) & 511); i <= nl; i += 512) {
++                this._block(b.splice(0, 16));
++            }
++        }
++        return this;
++    },
++
++    /**
++     * Complete hashing and output the hash value.
++     * @return {bitArray} The hash value, an array of 8 big-endian words.
++     */
++    finalize: function () {
++        var i, b = this._buffer, h = this._h;
++
++        // Round out and push the buffer
++        b = sjcl.bitArray.concat(b, [sjcl.bitArray.partial(1, 1)]);
++
++        // Round out the buffer to a multiple of 16 words, less the 2 length words.
++        for (i = b.length + 2; i & 15; i++) {
++            b.push(0);
++        }
++
++        // append the length
++        b.push(Math.floor(this._length / 0x100000000));
++        b.push(this._length | 0);
++
++        while (b.length) {
++            this._block(b.splice(0, 16));
++        }
++
++        this.reset();
++        return h;
++    },
++
++    /**
++     * The SHA-256 initialization vector, to be precomputed.
++     * @private
++     */
++    _init: [],
++    /*
++    _init:[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19],
++    */
++
++    /**
++     * The SHA-256 hash key, to be precomputed.
++     * @private
++     */
++    _key: [],
++    /*
++    _key:
++      [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++       0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++       0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++       0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++       0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++       0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++       0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++       0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2],
++    */
++
++
++    /**
++     * Function to precompute _init and _key.
++     * @private
++     */
++    _precompute: function () {
++        var i = 0, prime = 2, factor, isPrime;
++
++        function frac(x) { return (x - Math.floor(x)) * 0x100000000 | 0; }
++
++        for (; i < 64; prime++) {
++            isPrime = true;
++            for (factor = 2; factor * factor <= prime; factor++) {
++                if (prime % factor === 0) {
++                    isPrime = false;
++                    break;
++                }
++            }
++            if (isPrime) {
++                if (i < 8) {
++                    this._init[i] = frac(Math.pow(prime, 1 / 2));
++                }
++                this._key[i] = frac(Math.pow(prime, 1 / 3));
++                i++;
++            }
++        }
++    },
++
++    /**
++     * Perform one cycle of SHA-256.
++     * @param {Uint32Array|bitArray} w one block of words.
++     * @private
++     */
++    _block: function (w) {
++        var i, tmp, a, b,
++            h = this._h,
++            k = this._key,
++            h0 = h[0], h1 = h[1], h2 = h[2], h3 = h[3],
++            h4 = h[4], h5 = h[5], h6 = h[6], h7 = h[7];
++
++        /* Rationale for placement of |0 :
++         * If a value can overflow is original 32 bits by a factor of more than a few
++         * million (2^23 ish), there is a possibility that it might overflow the
++         * 53-bit mantissa and lose precision.
++         *
++         * To avoid this, we clamp back to 32 bits by |'ing with 0 on any value that
++         * propagates around the loop, and on the hash state h[].  I don't believe
++         * that the clamps on h4 and on h0 are strictly necessary, but it's close
++         * (for h4 anyway), and better safe than sorry.
++         *
++         * The clamps on h[] are necessary for the output to be correct even in the
++         * common case and for short inputs.
++         */
++        for (i = 0; i < 64; i++) {
++            // load up the input word for this round
++            if (i < 16) {
++                tmp = w[i];
++            } else {
++                a = w[(i + 1) & 15];
++                b = w[(i + 14) & 15];
++                tmp = w[i & 15] = ((a >>> 7 ^ a >>> 18 ^ a >>> 3 ^ a << 25 ^ a << 14) +
++                    (b >>> 17 ^ b >>> 19 ^ b >>> 10 ^ b << 15 ^ b << 13) +
++                    w[i & 15] + w[(i + 9) & 15]) | 0;
++            }
++
++            tmp = (tmp + h7 + (h4 >>> 6 ^ h4 >>> 11 ^ h4 >>> 25 ^ h4 << 26 ^ h4 << 21 ^ h4 << 7) + (h6 ^ h4 & (h5 ^ h6)) + k[i]); // | 0;
++
++            // shift register
++            h7 = h6; h6 = h5; h5 = h4;
++            h4 = h3 + tmp | 0;
++            h3 = h2; h2 = h1; h1 = h0;
++
++            h0 = (tmp + ((h1 & h2) ^ (h3 & (h1 ^ h2))) + (h1 >>> 2 ^ h1 >>> 13 ^ h1 >>> 22 ^ h1 << 30 ^ h1 << 19 ^ h1 << 10)) | 0;
++        }
++
++        h[0] = h[0] + h0 | 0;
++        h[1] = h[1] + h1 | 0;
++        h[2] = h[2] + h2 | 0;
++        h[3] = h[3] + h3 | 0;
++        h[4] = h[4] + h4 | 0;
++        h[5] = h[5] + h5 | 0;
++        h[6] = h[6] + h6 | 0;
++        h[7] = h[7] + h7 | 0;
++    }
++};
++
++/** @fileOverview Random number generator.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ * @author Michael Brooks
++ * @author Steve Thomas
++ */
++
++/** 
++ * @class Random number generator
++ * @description
++ * <b>Use sjcl.random as a singleton for this class!</b>
++ * <p>
++ * This random number generator is a derivative of Ferguson and Schneier's
++ * generator Fortuna.  It collects entropy from various events into several
++ * pools, implemented by streaming SHA-256 instances.  It differs from
++ * ordinary Fortuna in a few ways, though.
++ * </p>
++ *
++ * <p>
++ * Most importantly, it has an entropy estimator.  This is present because
++ * there is a strong conflict here between making the generator available
++ * as soon as possible, and making sure that it doesn't "run on empty".
++ * In Fortuna, there is a saved state file, and the system is likely to have
++ * time to warm up.
++ * </p>
++ *
++ * <p>
++ * Second, because users are unlikely to stay on the page for very long,
++ * and to speed startup time, the number of pools increases logarithmically:
++ * a new pool is created when the previous one is actually used for a reseed.
++ * This gives the same asymptotic guarantees as Fortuna, but gives more
++ * entropy to early reseeds.
++ * </p>
++ *
++ * <p>
++ * The entire mechanism here feels pretty klunky.  Furthermore, there are
++ * several improvements that should be made, including support for
++ * dedicated cryptographic functions that may be present in some browsers;
++ * state files in local storage; cookies containing randomness; etc.  So
++ * look for improvements in future versions.
++ * </p>
++ * @constructor
++ */
++sjcl.prng = function (defaultParanoia) {
++
++    /* private */
++    this._pools = [new sjcl.hash.sha256()];
++    this._poolEntropy = [0];
++    this._reseedCount = 0;
++    this._robins = {};
++    this._eventId = 0;
++
++    this._collectorIds = {};
++    this._collectorIdNext = 0;
++
++    this._strength = 0;
++    this._poolStrength = 0;
++    this._nextReseed = 0;
++    this._key = [0, 0, 0, 0, 0, 0, 0, 0];
++    this._counter = [0, 0, 0, 0];
++    this._cipher = undefined;
++    this._defaultParanoia = defaultParanoia;
++
++    /* event listener stuff */
++    this._collectorsStarted = false;
++    this._callbacks = { progress: {}, seeded: {} };
++    this._callbackI = 0;
++
++    /* constants */
++    this._NOT_READY = 0;
++    this._READY = 1;
++    this._REQUIRES_RESEED = 2;
++
++    this._MAX_WORDS_PER_BURST = 65536;
++    this._PARANOIA_LEVELS = [0, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
++    this._MILLISECONDS_PER_RESEED = 30000;
++    this._BITS_PER_RESEED = 80;
++};
++
++sjcl.prng.prototype = {
++    /** Generate several random words, and return them in an array.
++     * A word consists of 32 bits (4 bytes)
++     * @param {Number} nwords The number of words to generate.
++     */
++    randomWords: function (nwords, paranoia) {
++        var out = [], i, readiness = this.isReady(paranoia), g;
++
++        if (readiness === this._NOT_READY) {
++            throw new sjcl.exception.notReady("generator isn't seeded");
++        } else if (readiness & this._REQUIRES_RESEED) {
++            this._reseedFromPools(!(readiness & this._READY));
++        }
++
++        for (i = 0; i < nwords; i += 4) {
++            if ((i + 1) % this._MAX_WORDS_PER_BURST === 0) {
++                this._gate();
++            }
++
++            g = this._gen4words();
++            out.push(g[0], g[1], g[2], g[3]);
++        }
++        this._gate();
++
++        return out.slice(0, nwords);
++    },
++
++    setDefaultParanoia: function (paranoia, allowZeroParanoia) {
++        if (paranoia === 0 && allowZeroParanoia !== "Setting paranoia=0 will ruin your security; use it only for testing") {
++            throw new sjcl.exception.invalid("Setting paranoia=0 will ruin your security; use it only for testing");
++        }
++
++        this._defaultParanoia = paranoia;
++    },
++
++    /**
++     * Add entropy to the pools.
++     * @param data The entropic value.  Should be a 32-bit integer, array of 32-bit integers, or string
++     * @param {Number} estimatedEntropy The estimated entropy of data, in bits
++     * @param {String} source The source of the entropy, eg "mouse"
++     */
++    addEntropy: function (data, estimatedEntropy, source) {
++        source = source || "user";
++
++        var id,
++            i, tmp,
++            t = (new Date()).valueOf(),
++            robin = this._robins[source],
++            oldReady = this.isReady(), err = 0, objName;
++
++        id = this._collectorIds[source];
++        if (id === undefined) { id = this._collectorIds[source] = this._collectorIdNext++; }
++
++        if (robin === undefined) { robin = this._robins[source] = 0; }
++        this._robins[source] = (this._robins[source] + 1) % this._pools.length;
++
++        switch (typeof (data)) {
++
++            case "number":
++                if (estimatedEntropy === undefined) {
++                    estimatedEntropy = 1;
++                }
++                this._pools[robin].update([id, this._eventId++, 1, estimatedEntropy, t, 1, data | 0]);
++                break;
++
++            case "object":
++                objName = Object.prototype.toString.call(data);
++                if (objName === "[object Uint32Array]") {
++                    tmp = [];
++                    for (i = 0; i < data.length; i++) {
++                        tmp.push(data[i]);
++                    }
++                    data = tmp;
++                } else {
++                    if (objName !== "[object Array]") {
++                        err = 1;
++                    }
++                    for (i = 0; i < data.length && !err; i++) {
++                        if (typeof (data[i]) !== "number") {
++                            err = 1;
++                        }
++                    }
++                }
++                if (!err) {
++                    if (estimatedEntropy === undefined) {
++                        /* horrible entropy estimator */
++                        estimatedEntropy = 0;
++                        for (i = 0; i < data.length; i++) {
++                            tmp = data[i];
++                            while (tmp > 0) {
++                                estimatedEntropy++;
++                                tmp = tmp >>> 1;
++                            }
++                        }
++                    }
++                    this._pools[robin].update([id, this._eventId++, 2, estimatedEntropy, t, data.length].concat(data));
++                }
++                break;
++
++            case "string":
++                if (estimatedEntropy === undefined) {
++                    /* English text has just over 1 bit per character of entropy.
++                     * But this might be HTML or something, and have far less
++                     * entropy than English...  Oh well, let's just say one bit.
++                     */
++                    estimatedEntropy = data.length;
++                }
++                this._pools[robin].update([id, this._eventId++, 3, estimatedEntropy, t, data.length]);
++                this._pools[robin].update(data);
++                break;
++
++            default:
++                err = 1;
++        }
++        if (err) {
++            throw new sjcl.exception.bug("random: addEntropy only supports number, array of numbers or string");
++        }
++
++        /* record the new strength */
++        this._poolEntropy[robin] += estimatedEntropy;
++        this._poolStrength += estimatedEntropy;
++
++        /* fire off events */
++        if (oldReady === this._NOT_READY) {
++            if (this.isReady() !== this._NOT_READY) {
++                this._fireEvent("seeded", Math.max(this._strength, this._poolStrength));
++            }
++            this._fireEvent("progress", this.getProgress());
++        }
++    },
++
++    /** Is the generator ready? */
++    isReady: function (paranoia) {
++        var entropyRequired = this._PARANOIA_LEVELS[(paranoia !== undefined) ? paranoia : this._defaultParanoia];
++
++        if (this._strength && this._strength >= entropyRequired) {
++            return (this._poolEntropy[0] > this._BITS_PER_RESEED && (new Date()).valueOf() > this._nextReseed) ?
++                this._REQUIRES_RESEED | this._READY :
++                this._READY;
++        } else {
++            return (this._poolStrength >= entropyRequired) ?
++                this._REQUIRES_RESEED | this._NOT_READY :
++                this._NOT_READY;
++        }
++    },
++
++    /** Get the generator's progress toward readiness, as a fraction */
++    getProgress: function (paranoia) {
++        var entropyRequired = this._PARANOIA_LEVELS[paranoia ? paranoia : this._defaultParanoia];
++
++        if (this._strength >= entropyRequired) {
++            return 1.0;
++        } else {
++            return (this._poolStrength > entropyRequired) ?
++                1.0 :
++                this._poolStrength / entropyRequired;
++        }
++    },
++
++    /** start the built-in entropy collectors */
++    startCollectors: function () {
++        if (this._collectorsStarted) { return; }
++
++        this._eventListener = {
++            loadTimeCollector: this._bind(this._loadTimeCollector),
++            mouseCollector: this._bind(this._mouseCollector),
++            keyboardCollector: this._bind(this._keyboardCollector),
++            accelerometerCollector: this._bind(this._accelerometerCollector),
++            touchCollector: this._bind(this._touchCollector)
++        };
++
++        if (window.addEventListener) {
++            window.addEventListener("load", this._eventListener.loadTimeCollector, false);
++            window.addEventListener("mousemove", this._eventListener.mouseCollector, false);
++            window.addEventListener("keypress", this._eventListener.keyboardCollector, false);
++            window.addEventListener("devicemotion", this._eventListener.accelerometerCollector, false);
++            window.addEventListener("touchmove", this._eventListener.touchCollector, false);
++        } else if (document.attachEvent) {
++            document.attachEvent("onload", this._eventListener.loadTimeCollector);
++            document.attachEvent("onmousemove", this._eventListener.mouseCollector);
++            document.attachEvent("keypress", this._eventListener.keyboardCollector);
++        } else {
++            throw new sjcl.exception.bug("can't attach event");
++        }
++
++        this._collectorsStarted = true;
++    },
++
++    /** stop the built-in entropy collectors */
++    stopCollectors: function () {
++        if (!this._collectorsStarted) { return; }
++
++        if (window.removeEventListener) {
++            window.removeEventListener("load", this._eventListener.loadTimeCollector, false);
++            window.removeEventListener("mousemove", this._eventListener.mouseCollector, false);
++            window.removeEventListener("keypress", this._eventListener.keyboardCollector, false);
++            window.removeEventListener("devicemotion", this._eventListener.accelerometerCollector, false);
++            window.removeEventListener("touchmove", this._eventListener.touchCollector, false);
++        } else if (document.detachEvent) {
++            document.detachEvent("onload", this._eventListener.loadTimeCollector);
++            document.detachEvent("onmousemove", this._eventListener.mouseCollector);
++            document.detachEvent("keypress", this._eventListener.keyboardCollector);
++        }
++
++        this._collectorsStarted = false;
++    },
++
++    /* use a cookie to store entropy.
++    useCookie: function (all_cookies) {
++        throw new sjcl.exception.bug("random: useCookie is unimplemented");
++    },*/
++
++    /** add an event listener for progress or seeded-ness. */
++    addEventListener: function (name, callback) {
++        this._callbacks[name][this._callbackI++] = callback;
++    },
++
++    /** remove an event listener for progress or seeded-ness */
++    removeEventListener: function (name, cb) {
++        var i, j, cbs = this._callbacks[name], jsTemp = [];
++
++        /* I'm not sure if this is necessary; in C++, iterating over a
++         * collection and modifying it at the same time is a no-no.
++         */
++
++        for (j in cbs) {
++            if (cbs.hasOwnProperty(j) && cbs[j] === cb) {
++                jsTemp.push(j);
++            }
++        }
++
++        for (i = 0; i < jsTemp.length; i++) {
++            j = jsTemp[i];
++            delete cbs[j];
++        }
++    },
++
++    _bind: function (func) {
++        var that = this;
++        return function () {
++            func.apply(that, arguments);
++        };
++    },
++
++    /** Generate 4 random words, no reseed, no gate.
++     * @private
++     */
++    _gen4words: function () {
++        for (var i = 0; i < 4; i++) {
++            this._counter[i] = this._counter[i] + 1 | 0;
++            if (this._counter[i]) { break; }
++        }
++        return this._cipher.encrypt(this._counter);
++    },
++
++    /* Rekey the AES instance with itself after a request, or every _MAX_WORDS_PER_BURST words.
++     * @private
++     */
++    _gate: function () {
++        this._key = this._gen4words().concat(this._gen4words());
++        this._cipher = new sjcl.cipher.aes(this._key);
++    },
++
++    /** Reseed the generator with the given words
++     * @private
++     */
++    _reseed: function (seedWords) {
++        this._key = sjcl.hash.sha256.hash(this._key.concat(seedWords));
++        this._cipher = new sjcl.cipher.aes(this._key);
++        for (var i = 0; i < 4; i++) {
++            this._counter[i] = this._counter[i] + 1 | 0;
++            if (this._counter[i]) { break; }
++        }
++    },
++
++    /** reseed the data from the entropy pools
++     * @param full If set, use all the entropy pools in the reseed.
++     */
++    _reseedFromPools: function (full) {
++        var reseedData = [], strength = 0, i;
++
++        this._nextReseed = reseedData[0] =
++            (new Date()).valueOf() + this._MILLISECONDS_PER_RESEED;
++
++        for (i = 0; i < 16; i++) {
++            /* On some browsers, this is cryptographically random.  So we might
++             * as well toss it in the pot and stir...
++             */
++            reseedData.push(Math.random() * 0x100000000 | 0);
++        }
++
++        for (i = 0; i < this._pools.length; i++) {
++            reseedData = reseedData.concat(this._pools[i].finalize());
++            strength += this._poolEntropy[i];
++            this._poolEntropy[i] = 0;
++
++            if (!full && (this._reseedCount & (1 << i))) { break; }
++        }
++
++        /* if we used the last pool, push a new one onto the stack */
++        if (this._reseedCount >= 1 << this._pools.length) {
++            this._pools.push(new sjcl.hash.sha256());
++            this._poolEntropy.push(0);
++        }
++
++        /* how strong was this reseed? */
++        this._poolStrength -= strength;
++        if (strength > this._strength) {
++            this._strength = strength;
++        }
++
++        this._reseedCount++;
++        this._reseed(reseedData);
++    },
++
++    _keyboardCollector: function () {
++        this._addCurrentTimeToEntropy(1);
++    },
++
++    _mouseCollector: function (ev) {
++        var x, y;
++
++        try {
++            x = ev.x || ev.clientX || ev.offsetX || 0;
++            y = ev.y || ev.clientY || ev.offsetY || 0;
++        } catch (err) {
++            // Event originated from a secure element. No mouse position available.
++            x = 0;
++            y = 0;
++        }
++
++        if (x != 0 && y != 0) {
++            this.addEntropy([x, y], 2, "mouse");
++        }
++
++        this._addCurrentTimeToEntropy(0);
++    },
++
++    _touchCollector: function (ev) {
++        var touch = ev.touches[0] || ev.changedTouches[0];
++        var x = touch.pageX || touch.clientX,
++            y = touch.pageY || touch.clientY;
++
++        this.addEntropy([x, y], 1, "touch");
++
++        this._addCurrentTimeToEntropy(0);
++    },
++
++    _loadTimeCollector: function () {
++        this._addCurrentTimeToEntropy(2);
++    },
++
++    _addCurrentTimeToEntropy: function (estimatedEntropy) {
++        if (typeof window !== 'undefined' && window.performance && typeof window.performance.now === "function") {
++            //how much entropy do we want to add here?
++            this.addEntropy(window.performance.now(), estimatedEntropy, "loadtime");
++        } else {
++            this.addEntropy((new Date()).valueOf(), estimatedEntropy, "loadtime");
++        }
++    },
++    _accelerometerCollector: function (ev) {
++        var ac = ev.accelerationIncludingGravity.x || ev.accelerationIncludingGravity.y || ev.accelerationIncludingGravity.z;
++        if (window.orientation) {
++            var or = window.orientation;
++            if (typeof or === "number") {
++                this.addEntropy(or, 1, "accelerometer");
++            }
++        }
++        if (ac) {
++            this.addEntropy(ac, 2, "accelerometer");
++        }
++        this._addCurrentTimeToEntropy(0);
++    },
++
++    _fireEvent: function (name, arg) {
++        var j, cbs = sjcl.random._callbacks[name], cbsTemp = [];
++        /* TODO: there is a race condition between removing collectors and firing them */
++
++        /* I'm not sure if this is necessary; in C++, iterating over a
++         * collection and modifying it at the same time is a no-no.
++         */
++
++        for (j in cbs) {
++            if (cbs.hasOwnProperty(j)) {
++                cbsTemp.push(cbs[j]);
++            }
++        }
++
++        for (j = 0; j < cbsTemp.length; j++) {
++            cbsTemp[j](arg);
++        }
++    }
++};
++
++/** an instance for the prng.
++* @see sjcl.prng
++*/
++sjcl.random = new sjcl.prng(6);
++
++(function () {
++    // function for getting nodejs crypto module. catches and ignores errors.
++    function getCryptoModule() {
++        try {
++            return require('crypto');
++        }
++        catch (e) {
++            return null;
++        }
++    }
++
++    try {
++        var buf, crypt, ab;
++
++        // get cryptographically strong entropy depending on runtime environment
++        if (typeof module !== 'undefined' && module.exports && (crypt = getCryptoModule()) && crypt.randomBytes) {
++            buf = crypt.randomBytes(1024 / 8);
++            buf = new Uint32Array(new Uint8Array(buf).buffer);
++            sjcl.random.addEntropy(buf, 1024, "crypto.randomBytes");
++
++        } else if (typeof window !== 'undefined' && typeof Uint32Array !== 'undefined') {
++            ab = new Uint32Array(32);
++            if (window.crypto && window.crypto.getRandomValues) {
++                window.crypto.getRandomValues(ab);
++            } else if (window.msCrypto && window.msCrypto.getRandomValues) {
++                window.msCrypto.getRandomValues(ab);
++            } else {
++                return;
++            }
++
++            // get cryptographically strong entropy in Webkit
++            sjcl.random.addEntropy(ab, 1024, "crypto.getRandomValues");
++
++        } else {
++            // no getRandomValues :-(
++        }
++    } catch (e) {
++        if (typeof window !== 'undefined' && window.console) {
++            console.log("There was an error collecting entropy from the browser:");
++            console.log(e);
++            //we do not want the library to fail due to randomness not being maintained.
++        }
++    }
++}());
++
++/** @fileOverview Low-level AES implementation.
++ *
++ * This file contains a low-level implementation of AES, optimized for
++ * size and for efficiency on several browsers.  It is based on
++ * OpenSSL's aes_core.c, a public-domain implementation by Vincent
++ * Rijmen, Antoon Bosselaers and Paulo Barreto.
++ *
++ * An older version of this implementation is available in the public
++ * domain, but this one is (c) Emily Stark, Mike Hamburg, Dan Boneh,
++ * Stanford University 2008-2010 and BSD-licensed for liability
++ * reasons.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/**
++ * Schedule out an AES key for both encryption and decryption.  This
++ * is a low-level class.  Use a cipher mode to do bulk encryption.
++ *
++ * @constructor
++ * @param {Array} key The key as an array of 4, 6 or 8 words.
++ */
++sjcl.cipher.aes = function (key) {
++    if (!this._tables[0][0][0]) {
++        this._precompute();
++    }
++
++    var i, j, tmp,
++        encKey, decKey,
++        sbox = this._tables[0][4], decTable = this._tables[1],
++        keyLen = key.length, rcon = 1;
++
++    if (keyLen !== 4 && keyLen !== 6 && keyLen !== 8) {
++        throw new sjcl.exception.invalid("invalid aes key size");
++    }
++
++    this._key = [encKey = key.slice(0), decKey = []];
++
++    // schedule encryption keys
++    for (i = keyLen; i < 4 * keyLen + 28; i++) {
++        tmp = encKey[i - 1];
++
++        // apply sbox
++        if (i % keyLen === 0 || (keyLen === 8 && i % keyLen === 4)) {
++            tmp = sbox[tmp >>> 24] << 24 ^ sbox[tmp >> 16 & 255] << 16 ^ sbox[tmp >> 8 & 255] << 8 ^ sbox[tmp & 255];
++
++            // shift rows and add rcon
++            if (i % keyLen === 0) {
++                tmp = tmp << 8 ^ tmp >>> 24 ^ rcon << 24;
++                rcon = rcon << 1 ^ (rcon >> 7) * 283;
++            }
++        }
++
++        encKey[i] = encKey[i - keyLen] ^ tmp;
++    }
++
++    // schedule decryption keys
++    for (j = 0; i; j++, i--) {
++        tmp = encKey[j & 3 ? i : i - 4];
++        if (i <= 4 || j < 4) {
++            decKey[j] = tmp;
++        } else {
++            decKey[j] = decTable[0][sbox[tmp >>> 24]] ^
++                decTable[1][sbox[tmp >> 16 & 255]] ^
++                decTable[2][sbox[tmp >> 8 & 255]] ^
++                decTable[3][sbox[tmp & 255]];
++        }
++    }
++};
++
++sjcl.cipher.aes.prototype = {
++    // public
++    /* Something like this might appear here eventually
++    name: "AES",
++    blockSize: 4,
++    keySizes: [4,6,8],
++    */
++
++    /**
++     * Encrypt an array of 4 big-endian words.
++     * @param {Array} data The plaintext.
++     * @return {Array} The ciphertext.
++     */
++    encrypt: function (data) { return this._crypt(data, 0); },
++
++    /**
++     * Decrypt an array of 4 big-endian words.
++     * @param {Array} data The ciphertext.
++     * @return {Array} The plaintext.
++     */
++    decrypt: function (data) { return this._crypt(data, 1); },
++
++    /**
++     * The expanded S-box and inverse S-box tables.  These will be computed
++     * on the client so that we don't have to send them down the wire.
++     *
++     * There are two tables, _tables[0] is for encryption and
++     * _tables[1] is for decryption.
++     *
++     * The first 4 sub-tables are the expanded S-box with MixColumns.  The
++     * last (_tables[01][4]) is the S-box itself.
++     *
++     * @private
++     */
++    _tables: [[[], [], [], [], []], [[], [], [], [], []]],
++
++    /**
++     * Expand the S-box tables.
++     *
++     * @private
++     */
++    _precompute: function () {
++        var encTable = this._tables[0], decTable = this._tables[1],
++            sbox = encTable[4], sboxInv = decTable[4],
++            i, x, xInv, d = [], th = [], x2, x4, x8, s, tEnc, tDec;
++
++        // Compute double and third tables
++        for (i = 0; i < 256; i++) {
++            th[(d[i] = i << 1 ^ (i >> 7) * 283) ^ i] = i;
++        }
++
++        for (x = xInv = 0; !sbox[x]; x ^= x2 || 1, xInv = th[xInv] || 1) {
++            // Compute sbox
++            s = xInv ^ xInv << 1 ^ xInv << 2 ^ xInv << 3 ^ xInv << 4;
++            s = s >> 8 ^ s & 255 ^ 99;
++            sbox[x] = s;
++            sboxInv[s] = x;
++
++            // Compute MixColumns
++            x8 = d[x4 = d[x2 = d[x]]];
++            tDec = x8 * 0x1010101 ^ x4 * 0x10001 ^ x2 * 0x101 ^ x * 0x1010100;
++            tEnc = d[s] * 0x101 ^ s * 0x1010100;
++
++            for (i = 0; i < 4; i++) {
++                encTable[i][x] = tEnc = tEnc << 24 ^ tEnc >>> 8;
++                decTable[i][s] = tDec = tDec << 24 ^ tDec >>> 8;
++            }
++        }
++
++        // Compactify.  Considerable speedup on Firefox.
++        for (i = 0; i < 5; i++) {
++            encTable[i] = encTable[i].slice(0);
++            decTable[i] = decTable[i].slice(0);
++        }
++    },
++
++    /**
++     * Encryption and decryption core.
++     * @param {Array} input Four words to be encrypted or decrypted.
++     * @param dir The direction, 0 for encrypt and 1 for decrypt.
++     * @return {Array} The four encrypted or decrypted words.
++     * @private
++     */
++    _crypt: function (input, dir) {
++        if (input.length !== 4) {
++            throw new sjcl.exception.invalid("invalid aes block size");
++        }
++
++        var key = this._key[dir],
++            // state variables a,b,c,d are loaded with pre-whitened data
++            a = input[0] ^ key[0],
++            b = input[dir ? 3 : 1] ^ key[1],
++            c = input[2] ^ key[2],
++            d = input[dir ? 1 : 3] ^ key[3],
++            a2, b2, c2,
++
++            nInnerRounds = key.length / 4 - 2,
++            i,
++            kIndex = 4,
++            out = [0, 0, 0, 0],
++            table = this._tables[dir],
++
++            // load up the tables
++            t0 = table[0],
++            t1 = table[1],
++            t2 = table[2],
++            t3 = table[3],
++            sbox = table[4];
++
++        // Inner rounds.  Cribbed from OpenSSL.
++        for (i = 0; i < nInnerRounds; i++) {
++            a2 = t0[a >>> 24] ^ t1[b >> 16 & 255] ^ t2[c >> 8 & 255] ^ t3[d & 255] ^ key[kIndex];
++            b2 = t0[b >>> 24] ^ t1[c >> 16 & 255] ^ t2[d >> 8 & 255] ^ t3[a & 255] ^ key[kIndex + 1];
++            c2 = t0[c >>> 24] ^ t1[d >> 16 & 255] ^ t2[a >> 8 & 255] ^ t3[b & 255] ^ key[kIndex + 2];
++            d = t0[d >>> 24] ^ t1[a >> 16 & 255] ^ t2[b >> 8 & 255] ^ t3[c & 255] ^ key[kIndex + 3];
++            kIndex += 4;
++            a = a2; b = b2; c = c2;
++        }
++
++        // Last round.
++        for (i = 0; i < 4; i++) {
++            out[dir ? 3 & -i : i] =
++                sbox[a >>> 24] << 24 ^
++                sbox[b >> 16 & 255] << 16 ^
++                sbox[c >> 8 & 255] << 8 ^
++                sbox[d & 255] ^
++                key[kIndex++];
++            a2 = a; a = b; b = c; c = d; d = a2;
++        }
++
++        return out;
++    }
++};
++
++/** @fileOverview HMAC implementation.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/** HMAC with the specified hash function.
++ * @constructor
++ * @param {bitArray} key the key for HMAC.
++ * @param {Object} [Hash=sjcl.hash.sha1] The hash function to use.
++ */
++sjcl.misc.hmac = function (key, Hash) {
++    this._hash = Hash = Hash || sjcl.hash.sha1;
++    var exKey = [[], []], i,
++        bs = Hash.prototype.blockSize / 32;
++    this._baseHash = [new Hash(), new Hash()];
++
++    if (key.length > bs) {
++        key = Hash.hash(key);
++    }
++
++    for (i = 0; i < bs; i++) {
++        exKey[0][i] = key[i] ^ 0x36363636;
++        exKey[1][i] = key[i] ^ 0x5C5C5C5C;
++    }
++
++    this._baseHash[0].update(exKey[0]);
++    this._baseHash[1].update(exKey[1]);
++    this._resultHash = new Hash(this._baseHash[0]);
++};
++
++/** HMAC with the specified hash function.  Also called encrypt since it's a prf.
++ * @param {bitArray|String} data The data to mac.
++ */
++sjcl.misc.hmac.prototype.encrypt = sjcl.misc.hmac.prototype.mac = function (data) {
++    if (!this._updated) {
++        this.update(data);
++        return this.digest(data);
++    } else {
++        throw new sjcl.exception.invalid("encrypt on already updated hmac called!");
++    }
++};
++
++sjcl.misc.hmac.prototype.reset = function () {
++    this._resultHash = new this._hash(this._baseHash[0]);
++    this._updated = false;
++};
++
++sjcl.misc.hmac.prototype.update = function (data) {
++    this._updated = true;
++    this._resultHash.update(data);
++};
++
++sjcl.misc.hmac.prototype.digest = function () {
++    var w = this._resultHash.finalize(), result = new (this._hash)(this._baseHash[1]).update(w).finalize();
++
++    this.reset();
++
++    return result;
++};
++
++/** @fileOverview Password-based key-derivation function, version 2.0.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/** Password-Based Key-Derivation Function, version 2.0.
++ *
++ * Generate keys from passwords using PBKDF2-HMAC-SHA1.
++ *
++ * This is the method specified by RSA's PKCS #5 standard.
++ *
++ * @param {bitArray|String} password  The password.
++ * @param {bitArray|String} salt The salt.  Should have lots of entropy.
++ * @param {Number} [count=1000] The number of iterations.  Higher numbers make the function slower but more secure.
++ * @param {Number} [length] The length of the derived key.  Defaults to the
++                            output size of the hash function.
++ * @param {Object} [Prff=sjcl.misc.hmac] The pseudorandom function family.
++ * @return {bitArray} the derived key.
++ */
++sjcl.misc.pbkdf2 = function (password, salt, count, length, Prff) {
++    count = count || 10000;
++
++    if (length < 0 || count < 0) {
++        throw new sjcl.exception.invalid("invalid params to pbkdf2");
++    }
++
++    if (typeof password === "string") {
++        password = sjcl.codec.utf8String.toBits(password);
++    }
++
++    if (typeof salt === "string") {
++        salt = sjcl.codec.utf8String.toBits(salt);
++    }
++
++    Prff = Prff || sjcl.misc.hmac;
++
++    var prf = new Prff(password),
++        u, ui, i, j, k, out = [], b = sjcl.bitArray;
++
++    for (k = 1; 32 * out.length < (length || 1); k++) {
++        u = ui = prf.encrypt(b.concat(salt, [k]));
++
++        for (i = 1; i < count; i++) {
++            ui = prf.encrypt(ui);
++            for (j = 0; j < ui.length; j++) {
++                u[j] ^= ui[j];
++            }
++        }
++
++        out = out.concat(u);
++    }
++
++    if (length) { out = b.clamp(out, length); }
++
++    return out;
++};
++
++/** @fileOverview CTR mode implementation.
++ *
++ * Special thanks to Roy Nicholson for pointing out a bug in our
++ * implementation.
++ *
++ * @author Emily Stark
++ * @author Mike Hamburg
++ * @author Dan Boneh
++ */
++
++/**
++ * Brian Gladman's CTR Mode.
++ * @namespace
++ */
++sjcl.mode.ctrGladman = {
++    /** The name of the mode.
++     * @constant
++     */
++    name: "ctrGladman",
++
++    /** Encrypt in CTR mode.
++     * @param {Object} prf The pseudorandom function.  It must have a block size of 16 bytes.
++     * @param {bitArray} plaintext The plaintext data.
++     * @param {bitArray} iv The initialization value.  It must be 128 bits.
++     * @param {bitArray} [adata=[]] The authenticated data.  Must be empty.
++     * @return The encrypted data, an array of bytes.
++     * @throws {sjcl.exception.invalid} if the IV isn't exactly 128 bits or if any adata is specified.
++     */
++    encrypt: function (prf, plaintext, iv, adata) {
++        return sjcl.mode.ctrGladman._calculate(prf, plaintext, iv, adata);
++    },
++
++    /** Decrypt in CTR mode.
++     * @param {Object} prf The pseudorandom function.  It must have a block size of 16 bytes.
++     * @param {bitArray} ciphertext The ciphertext data.
++     * @param {bitArray} iv The initialization value.  It must be 128 bits.
++     * @param {bitArray} [adata=[]] The authenticated data.  It must be empty.
++     * @return The decrypted data, an array of bytes.
++     * @throws {sjcl.exception.invalid} if the IV isn't exactly 128 bits or if any adata is specified.
++     * @throws {sjcl.exception.corrupt} if if the message is corrupt.
++     */
++    decrypt: function (prf, ciphertext, iv, adata) {
++        return sjcl.mode.ctrGladman._calculate(prf, ciphertext, iv, adata);
++    },
++
++    incWord: function (word) {
++        if (((word >> 24) & 0xff) === 0xff) { //overflow
++            var b1 = (word >> 16) & 0xff;
++            var b2 = (word >> 8) & 0xff;
++            var b3 = word & 0xff;
++
++            if (b1 === 0xff) { // overflow b1		 
++                b1 = 0;
++                if (b2 === 0xff) {
++                    b2 = 0;
++                    if (b3 === 0xff) {
++                        b3 = 0;
++                    } else {
++                        ++b3;
++                    }
++                } else {
++                    ++b2;
++                }
++            } else {
++                ++b1;
++            }
++
++            word = 0;
++            word += (b1 << 16);
++            word += (b2 << 8);
++            word += b3;
++        } else {
++            word += (0x01 << 24);
++        }
++        return word;
++    },
++
++    incCounter: function (counter) {
++        if ((counter[0] = this.incWord(counter[0])) === 0) {
++            // encr_data in fileenc.c from  Dr Brian Gladman's counts only with DWORD j < 8
++            counter[1] = this.incWord(counter[1]);
++        }
++        return counter;
++    },
++
++    _calculate: function (prf, data, iv, adata) {
++        var l, bl, res, c, d, e, i;
++        if (adata && adata.length) {
++            throw new sjcl.exception.invalid("ctr can't authenticate data");
++        }
++        if (sjcl.bitArray.bitLength(iv) !== 128) {
++            throw new sjcl.exception.invalid("ctr iv must be 128 bits");
++        }
++        if (!(l = data.length)) {
++            return [];
++        }
++        c = iv.slice(0);
++        d = data.slice(0);
++        bl = sjcl.bitArray.bitLength(d);
++        for (i = 0; i < l; i += 4) {
++            this.incCounter(c);
++            e = prf.encrypt(c);
++            d[i] ^= e[0];
++            d[i + 1] ^= e[1];
++            d[i + 2] ^= e[2];
++            d[i + 3] ^= e[3];
++        }
++        return sjcl.bitArray.clamp(d, bl);
++    }
++};
++
++module.exports = sjcl;
+\ No newline at end of file
+diff --git a/lib/zipEntries.js b/lib/zipEntries.js
+index 2e3aba9..882b3d8 100644
+--- a/lib/zipEntries.js
++++ b/lib/zipEntries.js
+@@ -122,6 +122,7 @@ ZipEntries.prototype = {
+             file.readLocalPart(this.reader);
+             file.handleUTF8();
+             file.processAttributes();
++            file.readCompressed(this.reader);
+         }
+     },
+     /**
+@@ -133,7 +134,8 @@ ZipEntries.prototype = {
+         this.reader.setIndex(this.centralDirOffset);
+         while (this.reader.readAndCheckSignature(sig.CENTRAL_FILE_HEADER)) {
+             file = new ZipEntry({
+-                zip64: this.zip64
++                zip64: this.zip64,
++                aes: {}
+             }, this.loadOptions);
+             file.readCentralPart(this.reader);
+             this.files.push(file);
+diff --git a/lib/zipEntry.js b/lib/zipEntry.js
+index f204524..a365f18 100644
+--- a/lib/zipEntry.js
++++ b/lib/zipEntry.js
+@@ -60,7 +60,7 @@ ZipEntry.prototype = {
+      * @param {DataReader} reader the reader to use.
+      */
+     readLocalPart: function(reader) {
+-        var compression, localExtraFieldsLength;
++        var localExtraFieldsLength;
+ 
+         // we already know everything from the central dir !
+         // If the central dir data are false, we are doomed.
+@@ -89,11 +89,31 @@ ZipEntry.prototype = {
+             throw new Error("Bug or corrupted zip : didn't get enough information from the central directory " + "(compressedSize === -1 || uncompressedSize === -1)");
+         }
+ 
+-        compression = findCompression(this.compressionMethod);
++    },
++
++    /**
++     * Read the compressed file data of a zip file and add the info in this object.
++     * @param {DataReader} reader the reader to use.
++     */
++    readCompressed: function(reader) {
++        var compression = findCompression(this.compressionMethod);
+         if (compression === null) { // no compression found
+             throw new Error("Corrupted zip : compression " + utils.pretty(this.compressionMethod) + " unknown (inner file : " + utils.transformTo("string", this.fileName) + ")");
+         }
+-        this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, reader.readData(this.compressedSize));
++        var compressContent = reader.readData(this.compressedSize);
++        if (this.isEncrypted() && !this.dir) {
++            if (this.options.aes.strength === undefined) {
++                throw new Error("Encrypted zip: unsupported encrypt method");
++            }
++            var decryptOptions = {
++                password: this.loadOptions.password,
++                strength: this.options.aes.strength,
++                version: this.options.aes.version
++            };
++            this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, compressContent, decryptOptions);
++        } else {
++            this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, compressContent);
++        }
+     },
+ 
+     /**
+@@ -118,14 +138,11 @@ ZipEntry.prototype = {
+         this.externalFileAttributes = reader.readInt(4);
+         this.localHeaderOffset = reader.readInt(4);
+ 
+-        if (this.isEncrypted()) {
+-            throw new Error("Encrypted zip are not supported");
+-        }
+-
+         // will be read in the local part, see the comments there
+         reader.skip(fileNameLength);
+         this.readExtraFields(reader);
+         this.parseZIP64ExtraField(reader);
++        this.parseAESExtraField();
+         this.fileComment = reader.readData(this.fileCommentLength);
+     },
+ 
+@@ -186,6 +203,24 @@ ZipEntry.prototype = {
+             this.diskNumberStart = extraReader.readInt(4);
+         }
+     },
++
++    /**
++     * Parse the AES extra field and add the info in the aes options.
++     */
++    parseAESExtraField: function() {
++        if (!this.extraFields[0x9901]) {
++            return;
++        }
++
++        // should be something, preparing the extra reader
++        var extraReader = readerFor(this.extraFields[0x9901].value);
++
++        this.options.aes.version = extraReader.readInt(2);
++        extraReader.skip(2);
++        this.options.aes.strength = extraReader.readInt(1);
++        this.compressionMethod = this.options.aes.compressionMethod = extraReader.readString(2);
++    },
++
+     /**
+      * Read the central part of a zip file and add the info in this object.
+      * @param {DataReader} reader the reader to use.
+@@ -214,6 +249,7 @@ ZipEntry.prototype = {
+ 
+         reader.setIndex(end);
+     },
++    
+     /**
+      * Apply an UTF8 transformation if needed.
+      */
+diff --git a/lib/zipObject.js b/lib/zipObject.js
+index 04d7b61..303af76 100644
+--- a/lib/zipObject.js
++++ b/lib/zipObject.js
+@@ -28,9 +28,27 @@ var ZipObject = function(name, data, options) {
+         compression : options.compression,
+         compressionOptions : options.compressionOptions
+     };
++    if (options.password || options.encryptStrength) {
++        this.encryptOptions = {
++            password: options.password,
++            strength: options.encryptStrength
++        };
++    }
+ };
+ 
+ ZipObject.prototype = {
++    /**
++     * Update the decrypt password for the compressed object.
++     * @param {String} password the decrypt password of the compressed object.
++     * @return this ZipObject object.
++     */
++    password: function(password) {
++        if (this._data.decryptOptions) {
++            this._data.decryptOptions.password = password;
++        }
++        return this;
++    },
++
+     /**
+      * Create an internal stream for the content of this object.
+      * @param {String} type the type of each chunk.
+diff --git a/test/asserts/generate.js b/test/asserts/generate.js
+index 4830be8..d42b789 100644
+--- a/test/asserts/generate.js
++++ b/test/asserts/generate.js
+@@ -245,6 +245,41 @@ JSZipTestUtils.testZipFile("STORE is the default method", "ref/text.zip", functi
+     })['catch'](JSZipTestUtils.assertNoError);
+ });
+ 
++JSZipTestUtils.testZipFile("AES-256 encrypted", "ref/aes.zip", function(assert, expected) {
++    var zip = new JSZip();
++    zip.file("aes.txt", "aes encrypted");
++    var done = assert.async();
++    zip.generateAsync({type:"arraybuffer", password:"12345678", encryptStrength: 3})
++    .then(function(content) {
++        JSZip.loadAsync(content, {password:"12345678"})
++        .then(function success(zip) {
++            return zip.file("aes.txt").async("string");
++        }).then(function (content) {
++            assert.equal(content, "aes encrypted", "Generated ZIP matches reference ZIP");
++            done();
++        });
++    })['catch'](JSZipTestUtils.assertNoError);
++});
++
++JSZipTestUtils.testZipFile("AES mixed encrypted", "ref/aes_only_one.zip", function(assert, expected) {
++    var zip = new JSZip();
++    zip.file("aes.txt", "aes encrypted",{
++        password: "12345678",
++        encryptStrength: 1
++    });
++    zip.file("other.txt","Hello");
++    var done = assert.async();
++    zip.generateAsync({type:"arraybuffer"})
++    .then(function(content) {
++        JSZip.loadAsync(content)
++        .then(function success(zip) {
++            return zip.file("aes.txt").password("12345678").async("string");
++        }).then(function (content) {
++            assert.equal(content, "aes encrypted", "Generated ZIP matches reference ZIP");
++            done();
++        });
++    })['catch'](JSZipTestUtils.assertNoError);
++});
+ 
+ function testLazyDecompression(assert, from, to) {
+     var done = assert.async();
+diff --git a/test/asserts/load.js b/test/asserts/load.js
+index c89978d..d24968e 100644
+--- a/test/asserts/load.js
++++ b/test/asserts/load.js
+@@ -425,7 +425,28 @@ QUnit.module("load", function () {
+         })['catch'](JSZipTestUtils.assertNoError);
+     });
+ 
++    JSZipTestUtils.testZipFile("aes encrypted zip file", "ref/aes.zip", function(assert, file) {
++        var done = assert.async();
++        JSZip.loadAsync(file, {password: "12345678"})
++        .then(function success(zip) {
++            return zip.file("aes.txt").async("string");
++        }).then(function (content) {
++            assert.equal(content, "aes encrypted", "the zip was correctly read.");
++            done();
++        })['catch'](JSZipTestUtils.assertNoError);
++    });
+ 
++    JSZipTestUtils.testZipFile("aes encrypted only one zip file", "ref/aes_only_one.zip", function(assert, file) {
++        var done = assert.async();
++        JSZip.loadAsync(file)
++        .then(function success(zip) {
++            return zip.file("aes.txt").password("12345678").async("string");
++        }).then(function (content) {
++            assert.equal(content, "aes encrypted", "the zip was correctly read.");
++            done();
++        })['catch'](JSZipTestUtils.assertNoError);
++    });
++    
+     JSZipTestUtils.testZipFile("load(promise) works", "ref/all.zip", function(assert, fileAsString) {
+         var done = assert.async();
+         JSZip.loadAsync(JSZip.external.Promise.resolve(fileAsString))
+@@ -525,7 +546,7 @@ QUnit.module("load", function () {
+             assert.ok(false, "Encryption is not supported, but no exception were thrown");
+             done();
+         }, function failure(e) {
+-            assert.equal(e.message, "Encrypted zip are not supported", "the error message is useful");
++            assert.equal(e.message, "Encrypted zip: unsupported encrypt method", "the error message is useful");
+             done();
+         });
+     });
+diff --git a/test/ref/aes.zip b/test/ref/aes.zip
+new file mode 100644
+index 0000000000000000000000000000000000000000..70da6c409812aa86cb4e075b4f47337531b398de
+GIT binary patch
+literal 175
+zcmWIWW@a&FU}Q*USZw+}V4p3|S4{>623{a$XW(W?OfA+csVHHb$<DyU;ONTCz)%p?
+z%{yU^ZRJnb@Xab4PEIy=Pv+!u_i6u{Yv9fiFUmgI(Q{K+?Cge`0B=Sn5eD2w18qP8
+Vm=*<iv$BB{Fan_ikd6d#7y!dlB%c5P
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/ref/aes_only_one.zip b/test/ref/aes_only_one.zip
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b7cad3fb34e517226e58512728f166549332b6a
+GIT binary patch
+literal 274
+zcmWIWW@a&FU}Q*UNH%>Ru+Ns~t0n^j11}J>GjKB`rWWg!RFp8zWM^PvaCBv6VAx+>
+zUOPwh^8D^?xBFR>kIZfj-|=!oTFb3_kC{6j+|}d_5B+%f)satXjsZY}xq!wnfDLZy
+zy!f3J$Od6fAkHtzNG$>x?U9<3lON#C$Rxsm+ZjL&NC4AO5dFAqLuif!GU0Xyc(byB
+Oq?mxP97wl<I1B*C+CVM<
+
+literal 0
+HcmV?d00001
+
+
+From a0d202393531491fdedc606d1bcd4ad00463ce85 Mon Sep 17 00:00:00 2001
+From: xqdoo00o <xqdoo00o@gmail.com>
+Date: Thu, 30 Jul 2020 19:41:14 +0800
+Subject: [PATCH 2/7] optimization
+
+---
+ .jshintignore                 |  2 +-
+ lib/aes.js                    | 70 +++++++++++++++++++++++++++++++
+ lib/aesWorker.js              | 78 -----------------------------------
+ lib/compressedObject.js       |  6 +--
+ lib/generate/ZipFileWorker.js |  8 ++--
+ 5 files changed, 78 insertions(+), 86 deletions(-)
+ create mode 100644 lib/aes.js
+ delete mode 100644 lib/aesWorker.js
+
+diff --git a/.jshintignore b/.jshintignore
+index aa78c23..3463b3d 100644
+--- a/.jshintignore
++++ b/.jshintignore
+@@ -1,2 +1,2 @@
+ node_modules
+-lib/sjcl.js
+\ No newline at end of file
++lib/sjcl.js
+diff --git a/lib/aes.js b/lib/aes.js
+new file mode 100644
+index 0000000..a125279
+--- /dev/null
++++ b/lib/aes.js
+@@ -0,0 +1,70 @@
++'use strict';
++var sjcl = require('./sjcl');
++
++/**
++ * Process(encrypt or decrypt) aes data.
++ * @param {String} action the process action name: either "Encrypt" or "Decrypt".
++ * @param {Uint8Array} data the data to process.
++ * @param {Object} options the options to use when (en/de)crypting.
++ * @return {Uint8Array} the processed data.
++ */
++function processData(action, data, options) {
++    var password = options.password;
++    var keyLen = 8 * options.strength + 8;
++    var macLen = keyLen;
++    var saltLen = keyLen / 2;
++    var version = options.version;
++    var passwordVerifierLen = 2;
++    var hmac;
++    var iv = [0, 0, 0, 0];
++
++    var salt = action === "Encrypt" ?
++        sjcl.random.randomWords(saltLen / 4) :
++        sjcl.codec.bytes.toBits(data.slice(0, saltLen));
++    var derivedKey = sjcl.misc.pbkdf2(password, salt, 1000, (macLen + keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
++
++    var aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, keyLen * 8);
++    var macKey = sjcl.bitArray.bitSlice(derivedKey, keyLen * 8, (keyLen + macLen) * 8);
++    var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (keyLen + macLen) * 8);
++
++    if (action === "Encrypt") {
++        var encryptedData = sjcl.mode.ctrGladman.encrypt(new sjcl.cipher.aes(aesKey), sjcl.codec.bytes.toBits(data), iv);
++        encryptedData = sjcl.bitArray.clamp(encryptedData, (data.length) * 8);
++
++        hmac = new sjcl.misc.hmac(macKey);
++        var macData = hmac.encrypt(encryptedData);
++        macData = sjcl.bitArray.clamp(macData, 10 * 8);
++
++        var fileData = sjcl.bitArray.concat(salt, derivedPassVerifier);
++        fileData = sjcl.bitArray.concat(fileData, encryptedData);
++        fileData = sjcl.bitArray.concat(fileData, macData);
++        return new Uint8Array(sjcl.codec.bytes.fromBits(fileData));
++    } else {
++        var passVerifyValue = sjcl.codec.bytes.toBits(data.slice(saltLen, saltLen + passwordVerifierLen));
++        if (!sjcl.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
++            throw new Error("Encrypted zip: incorrect password");
++        }
++
++        var encryptedValue = sjcl.codec.bytes.toBits(data.slice(saltLen + passwordVerifierLen, -10));
++        var macValue = sjcl.codec.bytes.toBits(data.slice(-10));
++        // if AE-2 format check mac
++        if (version === 2) {
++            hmac = new sjcl.misc.hmac(macKey);
++            var macVerifier = hmac.encrypt(encryptedValue);
++            macVerifier = sjcl.bitArray.clamp(macVerifier, 10 * 8);
++            if (!sjcl.bitArray.equal(macValue, macVerifier)) {
++                throw new Error("Corrupted zip: CRC failed");
++            }
++        }
++
++        var decryptData = sjcl.mode.ctrGladman.decrypt(new sjcl.cipher.aes(aesKey), encryptedValue, iv);
++        return new Uint8Array(sjcl.codec.bytes.fromBits(decryptData));
++    }
++}
++
++exports.encryptData = function (data, options) {
++    return processData("Encrypt", data, options);
++};
++exports.decryptData = function (data, options) {
++    return processData("Decrypt", data, options);
++};
+diff --git a/lib/aesWorker.js b/lib/aesWorker.js
+deleted file mode 100644
+index b83e3aa..0000000
+--- a/lib/aesWorker.js
++++ /dev/null
+@@ -1,78 +0,0 @@
+-'use strict';
+-var sjcl = require('./sjcl');
+-
+-/**
+- * A worker to handle aes zip file data.
+- * @param {String} action the process action name: either "Encrypt" or "Decrypt".
+- * @param {Object} options the options to use when (en/de)crypting.
+- */
+-function AesWorker(action, options) {
+-    this._crypto = sjcl;
+-    this._aesAction = action;
+-    this._password = options.password;
+-    this._keyLen = 8 * options.strength + 8;
+-    this._macLen = this._keyLen;
+-    this._saltLen = this._keyLen / 2;
+-    this._version = options.version;
+-    this._passVerifyLen = 2;
+-}
+-
+-/**
+- * Process(encrypt or decrypt) aes file data.
+- * @param {Uint8Array} data the data to process.
+- * @return {Uint8Array} the processed data.
+- */
+-AesWorker.prototype.processData = function (data) {
+-    var hmac;
+-    var iv = [0, 0, 0, 0];
+-
+-    var salt = this._aesAction === "Encrypt" ?
+-        this._crypto.random.randomWords(this._saltLen / 4) :
+-        this._crypto.codec.bytes.toBits(data.slice(0, this._saltLen));
+-    var derivedKey = this._crypto.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + this._passVerifyLen) * 8, this._crypto.misc.hmac);
+-
+-    var aesKey = this._crypto.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
+-    var macKey = this._crypto.bitArray.bitSlice(derivedKey, this._keyLen * 8, (this._keyLen + this._macLen) * 8);
+-    var derivedPassVerifier = this._crypto.bitArray.bitSlice(derivedKey, (this._keyLen + this._macLen) * 8);
+-
+-    if (this._aesAction === "Encrypt") {
+-        var encryptedData = this._crypto.mode.ctrGladman.encrypt(new this._crypto.cipher.aes(aesKey), this._crypto.codec.bytes.toBits(data), iv);
+-        encryptedData = this._crypto.bitArray.clamp(encryptedData, (data.length) * 8);
+-
+-        hmac = new this._crypto.misc.hmac(macKey);
+-        var macData = hmac.encrypt(encryptedData);
+-        macData = this._crypto.bitArray.clamp(macData, 10 * 8);
+-
+-        var fileData = this._crypto.bitArray.concat(salt, derivedPassVerifier);
+-        fileData = this._crypto.bitArray.concat(fileData, encryptedData);
+-        fileData = this._crypto.bitArray.concat(fileData, macData);
+-        return Uint8Array.from(this._crypto.codec.bytes.fromBits(fileData));
+-    } else {
+-        var passVerifyValue = this._crypto.codec.bytes.toBits(data.slice(this._saltLen, this._saltLen + this._passVerifyLen));
+-        if (!this._crypto.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
+-            throw new Error("Encrypted zip: incorrect password");
+-        }
+-
+-        var encryptedValue = this._crypto.codec.bytes.toBits(data.slice(this._saltLen + this._passVerifyLen, -10));
+-        var macValue = this._crypto.codec.bytes.toBits(data.slice(-10));
+-        // if AE-2 format check mac
+-        if (this._version === 2) {
+-            hmac = new this._crypto.misc.hmac(macKey);
+-            var macVerifier = hmac.encrypt(encryptedValue);
+-            macVerifier = this._crypto.bitArray.clamp(macVerifier, 10 * 8);
+-            if (!this._crypto.bitArray.equal(macValue, macVerifier)) {
+-                throw new Error("Corrupted zip: CRC failed");
+-            }
+-        }
+-
+-        var decryptData = this._crypto.mode.ctrGladman.decrypt(new this._crypto.cipher.aes(aesKey), encryptedValue, iv);
+-        return Uint8Array.from(this._crypto.codec.bytes.fromBits(decryptData));
+-    }
+-};
+-
+-exports.encryptWorker = function (encryptOptions) {
+-    return new AesWorker("Encrypt", encryptOptions);
+-};
+-exports.decryptWorker = function (decryptOptions) {
+-    return new AesWorker("Decrypt", decryptOptions);
+-};
+\ No newline at end of file
+diff --git a/lib/compressedObject.js b/lib/compressedObject.js
+index b1e6748..144fb63 100644
+--- a/lib/compressedObject.js
++++ b/lib/compressedObject.js
+@@ -5,7 +5,7 @@ var DataWorker = require('./stream/DataWorker');
+ var DataLengthProbe = require('./stream/DataLengthProbe');
+ var Crc32Probe = require('./stream/Crc32Probe');
+ var DataLengthProbe = require('./stream/DataLengthProbe');
+-var aesWorker = require('./aesWorker');
++var aes = require('./aes');
+ 
+ /**
+  * Represent a compressed object, with everything needed to decompress it.
+@@ -13,7 +13,7 @@ var aesWorker = require('./aesWorker');
+  * @param {number} compressedSize the size of the data compressed.
+  * @param {number} uncompressedSize the size of the data after decompression.
+  * @param {number} crc32 the crc32 of the decompressed file.
+- * @param {Object} compression the type of compression, see lib/compressions.js.
++ * @param {object} compression the type of compression, see lib/compressions.js.
+  * @param {String|ArrayBuffer|Uint8Array|Buffer} data the compressed data.
+  * @param {Object} decryptOptions the compressed object decrypt options.
+  */
+@@ -36,7 +36,7 @@ CompressedObject.prototype = {
+             if (!(this.decryptOptions.password && typeof this.decryptOptions.password === "string" )) {
+                 throw new Error("Encrypted zip: need password");
+             }
+-            this.compressedContent = aesWorker.decryptWorker(this.decryptOptions).processData(this.compressedContent);
++            this.compressedContent = aes.decryptData(this.compressedContent, this.decryptOptions);
+         }
+         var worker = new DataWorker(external.Promise.resolve(this.compressedContent))
+         .pipe(this.compression.uncompressWorker())
+diff --git a/lib/generate/ZipFileWorker.js b/lib/generate/ZipFileWorker.js
+index 061ea6e..2c8d953 100644
+--- a/lib/generate/ZipFileWorker.js
++++ b/lib/generate/ZipFileWorker.js
+@@ -5,7 +5,7 @@ var GenericWorker = require('../stream/GenericWorker');
+ var utf8 = require('../utf8');
+ var crc32 = require('../crc32');
+ var signature = require('../signature');
+-var aesWorker = require('../aesWorker');
++var aes = require('../aes');
+ 
+ /**
+  * Transform an integer into a string in hexadecimal.
+@@ -418,9 +418,9 @@ ZipFileWorker.prototype.push = function (chunk) {
+  * @param {Object} options encrypt options.
+  */
+ ZipFileWorker.prototype.encryptContent = function (contents, size, options) {
+-    //the file which size small than 16384B no need new Uint8Array.
++    //small size chunk no need new Uint8Array.
+     if (contents.length === 1) {
+-        return aesWorker.encryptWorker(options).processData(contents.shift().data);
++        return aes.encryptData(contents.shift().data, options);
+     }
+     var content = new Uint8Array(size);
+     var offset = 0;
+@@ -429,7 +429,7 @@ ZipFileWorker.prototype.encryptContent = function (contents, size, options) {
+         content.set(buffer.data, offset);
+         offset += buffer.data.length;
+     }
+-    return aesWorker.encryptWorker(options).processData(content);
++    return aes.encryptData(content, options);
+ };
+ 
+ /**
+
+From 6cdfec4d3a8ceb0c40eddd8f2ec304e5bdfff647 Mon Sep 17 00:00:00 2001
+From: xqdoo00o <xqdoo00o@gmail.com>
+Date: Mon, 10 Aug 2020 00:00:36 +0800
+Subject: [PATCH 3/7] use worker to increase speed
+
+---
+ lib/aes.js                    | 227 +++++++++++++++++++++++++---------
+ lib/compressedObject.js       |  42 +++++--
+ lib/generate/ZipFileWorker.js |  53 --------
+ lib/generate/index.js         |   4 +-
+ lib/object.js                 |   2 +-
+ lib/sjcl.js                   | 151 ++++++++++------------
+ lib/zipEntry.js               |  20 +--
+ lib/zipObject.js              |  12 +-
+ 8 files changed, 287 insertions(+), 224 deletions(-)
+
+diff --git a/lib/aes.js b/lib/aes.js
+index a125279..3003bd7 100644
+--- a/lib/aes.js
++++ b/lib/aes.js
+@@ -1,70 +1,185 @@
+ 'use strict';
+ var sjcl = require('./sjcl');
++var utils = require("./utils");
++var GenericWorker = require("./stream/GenericWorker");
++
++var passwordVerifierLen = 2;
++var authCodeLen = 10;
++
++/**
++ * Create a worker that uses sjcl to encrypt data.
++ * @constructor
++ * @param {Object} options the options to use when encrypting.
++ */
++function EncryptWorker(options) {
++    GenericWorker.call(this, "EncryptWorker");
++
++    this._password = options.password;
++    this._keyLen = this._macLen = 8 * options.strength + 8;
++    this._saltLen = this._keyLen /2;
++
++    this._aes = null;
++    this._mac = null;
++
++    // the `meta` object from the last chunk received
++    // this allow this worker to pass around metadata
++    this.meta = {};
++}
++
++utils.inherits(EncryptWorker, GenericWorker);
++
++/**
++ * @see GenericWorker.processChunk
++ */
++EncryptWorker.prototype.processChunk = function (chunk) {
++    this.meta = chunk.meta;
++
++    if (this._aes === null) {
++        this._createAes();
++    }
++    var encryptedData = this._aes.update(sjcl.codec.bytes.toBits(chunk.data));
++    this._mac.update(encryptedData);
++
++    this.push({
++        data : new Uint8Array(sjcl.codec.bytes.fromBits(encryptedData)),
++        meta : this.meta
++    });
++};
++
++/**
++ * @see GenericWorker.flush
++ */
++EncryptWorker.prototype.flush = function () {
++    GenericWorker.prototype.flush.call(this);
++
++    if (this._aes === null) {
++        this._createAes();
++    }
++    var macData = this._mac.digest();
++    macData = sjcl.bitArray.clamp(macData, authCodeLen * 8);
++
++    this.push({
++        data : new Uint8Array(sjcl.codec.bytes.fromBits(macData)),
++        meta : {percent: 100}
++    });
++};
++
++/**
++ * @see GenericWorker.cleanUp
++ */
++EncryptWorker.prototype.cleanUp = function () {
++    GenericWorker.prototype.cleanUp.call(this);
++    this._aes = null;
++    this._mac = null;
++};
++
++/**
++ * Create the _aes object.
++ */
++EncryptWorker.prototype._createAes = function () {
++    var salt = sjcl.random.randomWords(this._saltLen / 4);
++    var derivedKey = sjcl.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
++
++    var aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
++    this._aes = new sjcl.mode.ctrGladman(new sjcl.cipher.aes(aesKey), [0, 0, 0, 0]);
++
++    var macKey = sjcl.bitArray.bitSlice(derivedKey, this._keyLen * 8, (this._keyLen + this._macLen) * 8);
++    this._mac = new sjcl.misc.hmac(macKey);
++
++    var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (this._keyLen + this._macLen) * 8);
++    this.push({
++        data : new Uint8Array(sjcl.codec.bytes.fromBits(sjcl.bitArray.concat(salt, derivedPassVerifier))),
++        meta : {percent: 0}
++    });
++};
+ 
+ /**
+- * Process(encrypt or decrypt) aes data.
+- * @param {String} action the process action name: either "Encrypt" or "Decrypt".
+- * @param {Uint8Array} data the data to process.
+- * @param {Object} options the options to use when (en/de)crypting.
+- * @return {Uint8Array} the processed data.
++ * Create a worker that uses sjcl to decrypt data.
++ * @constructor
++ * @param {bitArray} key the key of AES.
+  */
+-function processData(action, data, options) {
++function DecryptWorker(key) {
++    GenericWorker.call(this, "DecryptWorker");
++    
++    this._aes = null;
++    this._aesKey = key;
++
++    // the `meta` object from the last chunk received
++    // this allow this worker to pass around metadata
++    this.meta = {};
++}
++
++utils.inherits(DecryptWorker, GenericWorker);
++
++/**
++ * @see GenericWorker.processChunk
++ */
++DecryptWorker.prototype.processChunk = function (chunk) {
++    this.meta = chunk.meta;
++
++    if (this._aes === null) {
++        this._createAes();
++    }
++
++    var decryptedData = this._aes.update(sjcl.codec.bytes.toBits(chunk.data));
++    this.push({
++        data : new Uint8Array(sjcl.codec.bytes.fromBits(decryptedData)),
++        meta : this.meta
++    });
++};
++
++/**
++ * @see GenericWorker.flush
++ */
++DecryptWorker.prototype.flush = function () {
++    GenericWorker.prototype.flush.call(this);
++};
++
++/**
++ * @see GenericWorker.cleanUp
++ */
++DecryptWorker.prototype.cleanUp = function () {
++    GenericWorker.prototype.cleanUp.call(this);
++    this._aes = null;
++};
++
++/**
++ * create the _aes object. 
++ */
++DecryptWorker.prototype._createAes = function () {
++    this._aes = new sjcl.mode.ctrGladman(new sjcl.cipher.aes(this._aesKey), [0, 0, 0, 0]);
++};
++
++exports.EncryptWorker = function (options) {
++    return new EncryptWorker(options);
++};
++
++exports.DecryptWorker = function (key) {
++    return new DecryptWorker(key);
++};
++
++/**
++ * Verify the password using sjcl.
++ * @param {Uint8Array} data the data to verify.
++ * @param {Object} options the options when verifying.
++ * @return {Object} the aes key and encrypted file data.
++ */
++exports.verifyPassword  = function (data, options) {
+     var password = options.password;
+     var keyLen = 8 * options.strength + 8;
+     var macLen = keyLen;
+     var saltLen = keyLen / 2;
+-    var version = options.version;
+-    var passwordVerifierLen = 2;
+-    var hmac;
+-    var iv = [0, 0, 0, 0];
+-
+-    var salt = action === "Encrypt" ?
+-        sjcl.random.randomWords(saltLen / 4) :
+-        sjcl.codec.bytes.toBits(data.slice(0, saltLen));
+-    var derivedKey = sjcl.misc.pbkdf2(password, salt, 1000, (macLen + keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
+ 
+-    var aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, keyLen * 8);
+-    var macKey = sjcl.bitArray.bitSlice(derivedKey, keyLen * 8, (keyLen + macLen) * 8);
++    var salt = sjcl.codec.bytes.toBits(data.slice(0, saltLen));
++    var derivedKey = sjcl.misc.pbkdf2(password, salt, 1000, (macLen + keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
+     var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (keyLen + macLen) * 8);
+-
+-    if (action === "Encrypt") {
+-        var encryptedData = sjcl.mode.ctrGladman.encrypt(new sjcl.cipher.aes(aesKey), sjcl.codec.bytes.toBits(data), iv);
+-        encryptedData = sjcl.bitArray.clamp(encryptedData, (data.length) * 8);
+-
+-        hmac = new sjcl.misc.hmac(macKey);
+-        var macData = hmac.encrypt(encryptedData);
+-        macData = sjcl.bitArray.clamp(macData, 10 * 8);
+-
+-        var fileData = sjcl.bitArray.concat(salt, derivedPassVerifier);
+-        fileData = sjcl.bitArray.concat(fileData, encryptedData);
+-        fileData = sjcl.bitArray.concat(fileData, macData);
+-        return new Uint8Array(sjcl.codec.bytes.fromBits(fileData));
+-    } else {
+-        var passVerifyValue = sjcl.codec.bytes.toBits(data.slice(saltLen, saltLen + passwordVerifierLen));
+-        if (!sjcl.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
+-            throw new Error("Encrypted zip: incorrect password");
+-        }
+-
+-        var encryptedValue = sjcl.codec.bytes.toBits(data.slice(saltLen + passwordVerifierLen, -10));
+-        var macValue = sjcl.codec.bytes.toBits(data.slice(-10));
+-        // if AE-2 format check mac
+-        if (version === 2) {
+-            hmac = new sjcl.misc.hmac(macKey);
+-            var macVerifier = hmac.encrypt(encryptedValue);
+-            macVerifier = sjcl.bitArray.clamp(macVerifier, 10 * 8);
+-            if (!sjcl.bitArray.equal(macValue, macVerifier)) {
+-                throw new Error("Corrupted zip: CRC failed");
+-            }
+-        }
+-
+-        var decryptData = sjcl.mode.ctrGladman.decrypt(new sjcl.cipher.aes(aesKey), encryptedValue, iv);
+-        return new Uint8Array(sjcl.codec.bytes.fromBits(decryptData));
++    var passVerifyValue = sjcl.codec.bytes.toBits(data.slice(saltLen, saltLen + passwordVerifierLen));
++    if (!sjcl.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
++        throw new Error("Encrypted zip: incorrect password");
+     }
+-}
+ 
+-exports.encryptData = function (data, options) {
+-    return processData("Encrypt", data, options);
+-};
+-exports.decryptData = function (data, options) {
+-    return processData("Decrypt", data, options);
++    return {
++        key: sjcl.bitArray.bitSlice(derivedKey, 0, keyLen * 8),
++        data: data.slice(saltLen + passwordVerifierLen, -authCodeLen)
++    };
+ };
+diff --git a/lib/compressedObject.js b/lib/compressedObject.js
+index 144fb63..acd23e7 100644
+--- a/lib/compressedObject.js
++++ b/lib/compressedObject.js
+@@ -4,7 +4,6 @@ var external = require("./external");
+ var DataWorker = require('./stream/DataWorker');
+ var DataLengthProbe = require('./stream/DataLengthProbe');
+ var Crc32Probe = require('./stream/Crc32Probe');
+-var DataLengthProbe = require('./stream/DataLengthProbe');
+ var aes = require('./aes');
+ 
+ /**
+@@ -32,15 +31,22 @@ CompressedObject.prototype = {
+      * @return {GenericWorker} the worker.
+      */
+     getContentWorker : function () {
+-        if (this.decryptOptions) {
++        var worker;
++        if (this.decryptOptions.strength) {
+             if (!(this.decryptOptions.password && typeof this.decryptOptions.password === "string" )) {
+                 throw new Error("Encrypted zip: need password");
+             }
+-            this.compressedContent = aes.decryptData(this.compressedContent, this.decryptOptions);
++            var result = aes.verifyPassword(this.compressedContent, this.decryptOptions);
++
++            worker = new DataWorker(external.Promise.resolve(result.data))
++                .pipe(aes.DecryptWorker(result.key))
++                .pipe(this.compression.uncompressWorker())
++                .pipe(new DataLengthProbe("data_length"));
++        }else{
++            worker = new DataWorker(external.Promise.resolve(this.compressedContent))
++            .pipe(this.compression.uncompressWorker())
++            .pipe(new DataLengthProbe("data_length"));
+         }
+-        var worker = new DataWorker(external.Promise.resolve(this.compressedContent))
+-        .pipe(this.compression.uncompressWorker())
+-        .pipe(new DataLengthProbe("data_length"));
+ 
+         var that = this;
+         worker.on("end", function () {
+@@ -72,13 +78,23 @@ CompressedObject.prototype = {
+  * @param {Object} compressionOptions the options to use when compressing.
+  * @return {GenericWorker} the new worker compressing the content.
+  */
+-CompressedObject.createWorkerFrom = function (uncompressedWorker, compression, compressionOptions) {
+-    return uncompressedWorker
+-    .pipe(new Crc32Probe())
+-    .pipe(new DataLengthProbe("uncompressedSize"))
+-    .pipe(compression.compressWorker(compressionOptions))
+-    .pipe(new DataLengthProbe("compressedSize"))
+-    .withStreamInfo("compression", compression);
++CompressedObject.createWorkerFrom = function (uncompressedWorker, compression, compressionOptions, encryptOptions) {
++    if (encryptOptions.password !== null) {
++        return uncompressedWorker
++        .pipe(new Crc32Probe())
++        .pipe(new DataLengthProbe("uncompressedSize"))
++        .pipe(compression.compressWorker(compressionOptions))
++        .pipe(aes.EncryptWorker(encryptOptions))
++        .pipe(new DataLengthProbe("compressedSize"))
++        .withStreamInfo("compression", compression);
++    }else{
++        return uncompressedWorker
++        .pipe(new Crc32Probe())
++        .pipe(new DataLengthProbe("uncompressedSize"))
++        .pipe(compression.compressWorker(compressionOptions))
++        .pipe(new DataLengthProbe("compressedSize"))
++        .withStreamInfo("compression", compression);
++    }
+ };
+ 
+ module.exports = CompressedObject;
+diff --git a/lib/generate/ZipFileWorker.js b/lib/generate/ZipFileWorker.js
+index 2c8d953..3a9958c 100644
+--- a/lib/generate/ZipFileWorker.js
++++ b/lib/generate/ZipFileWorker.js
+@@ -5,7 +5,6 @@ var GenericWorker = require('../stream/GenericWorker');
+ var utf8 = require('../utf8');
+ var crc32 = require('../crc32');
+ var signature = require('../signature');
+-var aes = require('../aes');
+ 
+ /**
+  * Transform an integer into a string in hexadecimal.
+@@ -370,8 +369,6 @@ function ZipFileWorker(streamFiles, comment, platform, encodeFileName) {
+     // the name of the file currently being added, null when handling the end of the zip file.
+     // Used for the emitted metadata.
+     this.currentFile = null;
+-    // The chunk tmp array if streamFiles and encryption in options.
+-    this.chunkTmp = [];
+ 
+     this._sources = [];
+ }
+@@ -389,16 +386,6 @@ ZipFileWorker.prototype.push = function (chunk) {
+     if (this.accumulate) {
+         this.contentBuffer.push(chunk);
+     } else {
+-        if (this.streamFiles && this.previous.streamInfo.file.encryptOptions.password !== null && chunk.data instanceof Uint8Array) {
+-            this.chunkTmp.push(chunk);
+-            if (chunk.meta.percent !== 100) {
+-                return;
+-            }
+-            var content = this.encryptContent(this.chunkTmp, this.previous.streamInfo.compressedSize, this.previous.streamInfo.file.encryptOptions);
+-            this.previous.streamInfo.compressedSize = content.length;
+-            chunk.data = content;
+-        }
+-
+         this.bytesWritten += chunk.data.length;
+ 
+         GenericWorker.prototype.push.call(this, {
+@@ -411,27 +398,6 @@ ZipFileWorker.prototype.push = function (chunk) {
+     }
+ };
+ 
+-/**
+- * Encrypt data after compression.
+- * @param {Array} contents the chunk file data array.
+- * @param {Number} size the file data total length.
+- * @param {Object} options encrypt options.
+- */
+-ZipFileWorker.prototype.encryptContent = function (contents, size, options) {
+-    //small size chunk no need new Uint8Array.
+-    if (contents.length === 1) {
+-        return aes.encryptData(contents.shift().data, options);
+-    }
+-    var content = new Uint8Array(size);
+-    var offset = 0;
+-    while (contents.length) {
+-        var buffer = contents.shift();
+-        content.set(buffer.data, offset);
+-        offset += buffer.data.length;
+-    }
+-    return aes.encryptData(content, options);
+-};
+-
+ /**
+  * The worker started a new source (an other worker).
+  * @param {Object} streamInfo the streamInfo object from the new source.
+@@ -462,25 +428,6 @@ ZipFileWorker.prototype.openedSource = function (streamInfo) {
+ ZipFileWorker.prototype.closedSource = function (streamInfo) {
+     this.accumulate = false;
+     var streamedContent = this.streamFiles && !streamInfo['file'].dir;
+-    if (streamInfo.file.encryptOptions.password !== null && !streamInfo['file'].dir) {
+-        if (!this.streamFiles) {
+-            var content = this.encryptContent(this.contentBuffer, streamInfo.compressedSize, streamInfo.file.encryptOptions);
+-            streamInfo.compressedSize = content.length;
+-            this.contentBuffer.push({
+-                data: content,
+-                meta: {
+-                    percent: 100
+-                }
+-            });
+-        } else if (streamInfo.uncompressedSize === 0) {
+-            this.push({
+-                data: new Uint8Array(),
+-                meta: {
+-                    percent: 100
+-                }
+-            });
+-        }
+-    }
+ 
+     var record = generateZipParts(streamInfo, streamedContent, true, this.currentSourceOffset, this.zipPlatform, this.encodeFileName);
+     this.dirRecords.push(record.dirRecord);
+diff --git a/lib/generate/index.js b/lib/generate/index.js
+index 39884dc..761834e 100644
+--- a/lib/generate/index.js
++++ b/lib/generate/index.js
+@@ -45,9 +45,11 @@ exports.generateWorker = function (zip, options, comment) {
+                 fileEncryptOptions.password = null;
+             } else if (typeof fileEncryptOptions.password !== "string") {
+                 throw new Error("Password is not a valid string.");
++            }else{
++                fileEncryptOptions.strength =  fileEncryptOptions.strength || 3;
+             }
+ 
+-            file._compressWorker(compression, compressionOptions)
++            file._compressWorker(compression, compressionOptions, fileEncryptOptions)
+             .withStreamInfo("file", {
+                 name : relativePath,
+                 dir : dir,
+diff --git a/lib/object.js b/lib/object.js
+index 6b585ce..fd33264 100644
+--- a/lib/object.js
++++ b/lib/object.js
+@@ -326,7 +326,7 @@ var out = {
+                 compression: "STORE",
+                 compressionOptions: null,
+                 password: null,
+-                encryptStrength: 3,
++                encryptStrength: null,
+                 type: "",
+                 platform: "DOS",
+                 comment: null,
+diff --git a/lib/sjcl.js b/lib/sjcl.js
+index e5b7f5e..4ca2cfa 100644
+--- a/lib/sjcl.js
++++ b/lib/sjcl.js
+@@ -1672,105 +1672,86 @@ sjcl.misc.pbkdf2 = function (password, salt, count, length, Prff) {
+  * @author Dan Boneh
+  */
+ 
++ /** Brian Gladman's CTR Mode.
++ * @constructor
++ * @param {Object} _prf The aes instance to generate key.
++ * @param {bitArray} _iv The iv for ctr mode, it must be 128 bits.
++ */
+ /**
+  * Brian Gladman's CTR Mode.
+  * @namespace
+  */
+-sjcl.mode.ctrGladman = {
+-    /** The name of the mode.
+-     * @constant
+-     */
+-    name: "ctrGladman",
+-
+-    /** Encrypt in CTR mode.
+-     * @param {Object} prf The pseudorandom function.  It must have a block size of 16 bytes.
+-     * @param {bitArray} plaintext The plaintext data.
+-     * @param {bitArray} iv The initialization value.  It must be 128 bits.
+-     * @param {bitArray} [adata=[]] The authenticated data.  Must be empty.
+-     * @return The encrypted data, an array of bytes.
+-     * @throws {sjcl.exception.invalid} if the IV isn't exactly 128 bits or if any adata is specified.
+-     */
+-    encrypt: function (prf, plaintext, iv, adata) {
+-        return sjcl.mode.ctrGladman._calculate(prf, plaintext, iv, adata);
+-    },
++sjcl.mode.ctrGladman = function(prf, iv){
++    this._prf = prf;
++    this._initIv = iv;
++    this._iv = iv;
++};
+ 
+-    /** Decrypt in CTR mode.
+-     * @param {Object} prf The pseudorandom function.  It must have a block size of 16 bytes.
+-     * @param {bitArray} ciphertext The ciphertext data.
+-     * @param {bitArray} iv The initialization value.  It must be 128 bits.
+-     * @param {bitArray} [adata=[]] The authenticated data.  It must be empty.
+-     * @return The decrypted data, an array of bytes.
+-     * @throws {sjcl.exception.invalid} if the IV isn't exactly 128 bits or if any adata is specified.
+-     * @throws {sjcl.exception.corrupt} if if the message is corrupt.
+-     */
+-    decrypt: function (prf, ciphertext, iv, adata) {
+-        return sjcl.mode.ctrGladman._calculate(prf, ciphertext, iv, adata);
+-    },
++sjcl.mode.ctrGladman.prototype.reset = function (){
++    this._iv = this._initIv;
++}
+ 
+-    incWord: function (word) {
+-        if (((word >> 24) & 0xff) === 0xff) { //overflow
+-            var b1 = (word >> 16) & 0xff;
+-            var b2 = (word >> 8) & 0xff;
+-            var b3 = word & 0xff;
+-
+-            if (b1 === 0xff) { // overflow b1		 
+-                b1 = 0;
+-                if (b2 === 0xff) {
+-                    b2 = 0;
+-                    if (b3 === 0xff) {
+-                        b3 = 0;
+-                    } else {
+-                        ++b3;
+-                    }
++/** Input some data to calculate.
++ * @param {bitArray} data the data to process, it must be intergral multiple of 128 bits unless it's the last.
++ */
++sjcl.mode.ctrGladman.prototype.update = function (data) {
++    return this.calculate(this._prf, data, this._iv);
++}
++
++sjcl.mode.ctrGladman.incWord =  function (word) {
++    if (((word >> 24) & 0xff) === 0xff) { //overflow
++        var b1 = (word >> 16) & 0xff;
++        var b2 = (word >> 8) & 0xff;
++        var b3 = word & 0xff;
++
++        if (b1 === 0xff) { // overflow b1   
++            b1 = 0;
++            if (b2 === 0xff) {
++                b2 = 0;
++                if (b3 === 0xff) {
++                    b3 = 0;
+                 } else {
+-                    ++b2;
++                    ++b3;
+                 }
+             } else {
+-                ++b1;
++                ++b2;
+             }
+-
+-            word = 0;
+-            word += (b1 << 16);
+-            word += (b2 << 8);
+-            word += b3;
+         } else {
+-            word += (0x01 << 24);
++            ++b1;
+         }
+-        return word;
+-    },
+ 
+-    incCounter: function (counter) {
+-        if ((counter[0] = this.incWord(counter[0])) === 0) {
+-            // encr_data in fileenc.c from  Dr Brian Gladman's counts only with DWORD j < 8
+-            counter[1] = this.incWord(counter[1]);
+-        }
+-        return counter;
+-    },
++        word = 0;
++        word += (b1 << 16);
++        word += (b2 << 8);
++        word += b3;
++    } else {
++        word += (0x01 << 24);
++    }
++    return word;
++};
+ 
+-    _calculate: function (prf, data, iv, adata) {
+-        var l, bl, res, c, d, e, i;
+-        if (adata && adata.length) {
+-            throw new sjcl.exception.invalid("ctr can't authenticate data");
+-        }
+-        if (sjcl.bitArray.bitLength(iv) !== 128) {
+-            throw new sjcl.exception.invalid("ctr iv must be 128 bits");
+-        }
+-        if (!(l = data.length)) {
+-            return [];
+-        }
+-        c = iv.slice(0);
+-        d = data.slice(0);
+-        bl = sjcl.bitArray.bitLength(d);
+-        for (i = 0; i < l; i += 4) {
+-            this.incCounter(c);
+-            e = prf.encrypt(c);
+-            d[i] ^= e[0];
+-            d[i + 1] ^= e[1];
+-            d[i + 2] ^= e[2];
+-            d[i + 3] ^= e[3];
+-        }
+-        return sjcl.bitArray.clamp(d, bl);
++sjcl.mode.ctrGladman.incCounter = function (counter) {
++    if ((counter[0] = sjcl.mode.ctrGladman.incWord(counter[0])) === 0) {
++        // encr_data in fileenc.c from  Dr Brian Gladman's counts only with DWORD j < 8
++        counter[1] = sjcl.mode.ctrGladman.incWord(counter[1]);
+     }
+ };
+ 
+-module.exports = sjcl;
+\ No newline at end of file
++sjcl.mode.ctrGladman.prototype.calculate = function (prf, data, iv) {
++    var l, bl, e, i;
++    if (!(l = data.length)) {
++        return [];
++    }
++    bl = sjcl.bitArray.bitLength(data);
++    for (i = 0; i < l; i += 4) {
++        sjcl.mode.ctrGladman.incCounter(iv);
++        e = prf.encrypt(iv);
++        data[i] ^= e[0];
++        data[i + 1] ^= e[1];
++        data[i + 2] ^= e[2];
++        data[i + 3] ^= e[3];
++    }
++    return sjcl.bitArray.clamp(data, bl);
++}
++
++module.exports = sjcl;
+diff --git a/lib/zipEntry.js b/lib/zipEntry.js
+index a365f18..ea2d816 100644
+--- a/lib/zipEntry.js
++++ b/lib/zipEntry.js
+@@ -101,19 +101,19 @@ ZipEntry.prototype = {
+             throw new Error("Corrupted zip : compression " + utils.pretty(this.compressionMethod) + " unknown (inner file : " + utils.transformTo("string", this.fileName) + ")");
+         }
+         var compressContent = reader.readData(this.compressedSize);
++        var decryptOptions = {
++            password: null,
++            strength: null
++        };
+         if (this.isEncrypted() && !this.dir) {
+-            if (this.options.aes.strength === undefined) {
++            if (!this.options.aes.strength) {
+                 throw new Error("Encrypted zip: unsupported encrypt method");
+             }
+-            var decryptOptions = {
+-                password: this.loadOptions.password,
+-                strength: this.options.aes.strength,
+-                version: this.options.aes.version
+-            };
+-            this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, compressContent, decryptOptions);
+-        } else {
+-            this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, compressContent);
+-        }
++            decryptOptions.password =  this.loadOptions.password;
++            decryptOptions.strength = this.options.aes.strength;
++            decryptOptions.version = this.options.aes.version;
++        } 
++        this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, compressContent, decryptOptions);
+     },
+ 
+     /**
+diff --git a/lib/zipObject.js b/lib/zipObject.js
+index 303af76..a1ccb1d 100644
+--- a/lib/zipObject.js
++++ b/lib/zipObject.js
+@@ -42,8 +42,8 @@ ZipObject.prototype = {
+      * @param {String} password the decrypt password of the compressed object.
+      * @return this ZipObject object.
+      */
+-    password: function(password) {
+-        if (this._data.decryptOptions) {
++    password: function (password) {
++        if (this._data.decryptOptions.strength) {
+             this._data.decryptOptions.password = password;
+         }
+         return this;
+@@ -110,10 +110,12 @@ ZipObject.prototype = {
+      * @param {Object} compressionOptions the options to use when compressing.
+      * @return Worker the worker.
+      */
+-    _compressWorker: function (compression, compressionOptions) {
++    _compressWorker: function (compression, compressionOptions, encryptOptions) {
+         if (
+             this._data instanceof CompressedObject &&
+-            this._data.compression.magic === compression.magic
++            this._data.compression.magic === compression.magic &&
++            this._data.decryptOptions.password === encryptOptions.password &&
++            this._data.decryptOptions.strength === encryptOptions.strength 
+         ) {
+             return this._data.getCompressedWorker();
+         } else {
+@@ -121,7 +123,7 @@ ZipObject.prototype = {
+             if(!this._dataBinary) {
+                 result = result.pipe(new utf8.Utf8EncodeWorker());
+             }
+-            return CompressedObject.createWorkerFrom(result, compression, compressionOptions);
++            return CompressedObject.createWorkerFrom(result, compression, compressionOptions, encryptOptions);
+         }
+     },
+     /**
+
+From 0f8e647c7be56186752eaae3cde5f0fff300f441 Mon Sep 17 00:00:00 2001
+From: xqdoo00o <xqdoo00o@gmail.com>
+Date: Tue, 11 Aug 2020 00:49:24 +0800
+Subject: [PATCH 4/7] reduce dist size, replace prng with native implementation
+
+---
+ lib/aes.js  |   2 +-
+ lib/sjcl.js | 890 ++++++----------------------------------------------
+ 2 files changed, 94 insertions(+), 798 deletions(-)
+
+diff --git a/lib/aes.js b/lib/aes.js
+index 3003bd7..77bc46c 100644
+--- a/lib/aes.js
++++ b/lib/aes.js
+@@ -77,7 +77,7 @@ EncryptWorker.prototype.cleanUp = function () {
+  * Create the _aes object.
+  */
+ EncryptWorker.prototype._createAes = function () {
+-    var salt = sjcl.random.randomWords(this._saltLen / 4);
++    var salt = sjcl.random.randomWords(this._saltLen);
+     var derivedKey = sjcl.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
+ 
+     var aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
+diff --git a/lib/sjcl.js b/lib/sjcl.js
+index 4ca2cfa..553f5aa 100644
+--- a/lib/sjcl.js
++++ b/lib/sjcl.js
+@@ -24,7 +24,7 @@ var sjcl = {
+     cipher: {},
+ 
+     /**
+-     * Hash functions.  Right now only SHA256 is implemented.
++     * Hash functions.
+      * @namespace
+      */
+     hash: {},
+@@ -147,27 +147,6 @@ sjcl.bitArray = {
+         return (bend === undefined) ? a : sjcl.bitArray.clamp(a, bend - bstart);
+     },
+ 
+-    /**
+-     * Extract a number packed into a bit array.
+-     * @param {bitArray} a The array to slice.
+-     * @param {Number} bstart The offset to the start of the slice, in bits.
+-     * @param {Number} blength The length of the number to extract.
+-     * @return {Number} The requested slice.
+-     */
+-    extract: function (a, bstart, blength) {
+-        // FIXME: this Math.floor is not necessary at all, but for some reason
+-        // seems to suppress a bug in the Chromium JIT.
+-        var x, sh = Math.floor((-bstart - blength) & 31);
+-        if ((bstart + blength - 1 ^ bstart) & -32) {
+-            // it crosses a boundary
+-            x = (a[bstart / 32 | 0] << (32 - sh)) ^ (a[bstart / 32 + 1 | 0] >>> sh);
+-        } else {
+-            // within a single word
+-            x = a[bstart / 32 | 0] >>> sh;
+-        }
+-        return x & ((1 << blength) - 1);
+-    },
+-
+     /**
+      * Concatenate two bit arrays.
+      * @param {bitArray} a1 The first array.
+@@ -281,27 +260,6 @@ sjcl.bitArray = {
+         shift2 = sjcl.bitArray.getPartial(last2);
+         out.push(sjcl.bitArray.partial(shift + shift2 & 31, (shift + shift2 > 32) ? carry : out.pop(), 1));
+         return out;
+-    },
+-
+-    /** xor a block of 4 words together.
+-     * @private
+-     */
+-    _xor4: function (x, y) {
+-        return [x[0] ^ y[0], x[1] ^ y[1], x[2] ^ y[2], x[3] ^ y[3]];
+-    },
+-
+-    /** byteswap a word array inplace.
+-     * (does not handle partial words)
+-     * @param {sjcl.bitArray} a word array
+-     * @return {sjcl.bitArray} byteswapped array
+-     */
+-    byteswapM: function (a) {
+-        var i, v, m = 0xff00;
+-        for (i = 0; i < a.length; ++i) {
+-            v = a[i];
+-            a[i] = (v >>> 24) | ((v >>> 8) & m) | ((v & m) << 8) | (v << 24);
+-        }
+-        return a;
+     }
+ };
+ 
+@@ -581,760 +539,6 @@ sjcl.hash.sha1.prototype = {
+     }
+ };
+ 
+-/** @fileOverview Javascript SHA-256 implementation.
+- *
+- * An older version of this implementation is available in the public
+- * domain, but this one is (c) Emily Stark, Mike Hamburg, Dan Boneh,
+- * Stanford University 2008-2010 and BSD-licensed for liability
+- * reasons.
+- *
+- * Special thanks to Aldo Cortesi for pointing out several bugs in
+- * this code.
+- *
+- * @author Emily Stark
+- * @author Mike Hamburg
+- * @author Dan Boneh
+- */
+-
+-/**
+- * Context for a SHA-256 operation in progress.
+- * @constructor
+- */
+-sjcl.hash.sha256 = function (hash) {
+-    if (!this._key[0]) { this._precompute(); }
+-    if (hash) {
+-        this._h = hash._h.slice(0);
+-        this._buffer = hash._buffer.slice(0);
+-        this._length = hash._length;
+-    } else {
+-        this.reset();
+-    }
+-};
+-
+-/**
+- * Hash a string or an array of words.
+- * @static
+- * @param {bitArray|String} data the data to hash.
+- * @return {bitArray} The hash value, an array of 16 big-endian words.
+- */
+-sjcl.hash.sha256.hash = function (data) {
+-    return (new sjcl.hash.sha256()).update(data).finalize();
+-};
+-
+-sjcl.hash.sha256.prototype = {
+-    /**
+-     * The hash's block size, in bits.
+-     * @constant
+-     */
+-    blockSize: 512,
+-
+-    /**
+-     * Reset the hash state.
+-     * @return this
+-     */
+-    reset: function () {
+-        this._h = this._init.slice(0);
+-        this._buffer = [];
+-        this._length = 0;
+-        return this;
+-    },
+-
+-    /**
+-     * Input several words to the hash.
+-     * @param {bitArray|String} data the data to hash.
+-     * @return this
+-     */
+-    update: function (data) {
+-        if (typeof data === "string") {
+-            data = sjcl.codec.utf8String.toBits(data);
+-        }
+-        var i, b = this._buffer = sjcl.bitArray.concat(this._buffer, data),
+-            ol = this._length,
+-            nl = this._length = ol + sjcl.bitArray.bitLength(data);
+-        if (nl > 9007199254740991) {
+-            throw new sjcl.exception.invalid("Cannot hash more than 2^53 - 1 bits");
+-        }
+-
+-        if (typeof Uint32Array !== 'undefined') {
+-            var c = new Uint32Array(b);
+-            var j = 0;
+-            for (i = 512 + ol - ((512 + ol) & 511); i <= nl; i += 512) {
+-                this._block(c.subarray(16 * j, 16 * (j + 1)));
+-                j += 1;
+-            }
+-            b.splice(0, 16 * j);
+-        } else {
+-            for (i = 512 + ol - ((512 + ol) & 511); i <= nl; i += 512) {
+-                this._block(b.splice(0, 16));
+-            }
+-        }
+-        return this;
+-    },
+-
+-    /**
+-     * Complete hashing and output the hash value.
+-     * @return {bitArray} The hash value, an array of 8 big-endian words.
+-     */
+-    finalize: function () {
+-        var i, b = this._buffer, h = this._h;
+-
+-        // Round out and push the buffer
+-        b = sjcl.bitArray.concat(b, [sjcl.bitArray.partial(1, 1)]);
+-
+-        // Round out the buffer to a multiple of 16 words, less the 2 length words.
+-        for (i = b.length + 2; i & 15; i++) {
+-            b.push(0);
+-        }
+-
+-        // append the length
+-        b.push(Math.floor(this._length / 0x100000000));
+-        b.push(this._length | 0);
+-
+-        while (b.length) {
+-            this._block(b.splice(0, 16));
+-        }
+-
+-        this.reset();
+-        return h;
+-    },
+-
+-    /**
+-     * The SHA-256 initialization vector, to be precomputed.
+-     * @private
+-     */
+-    _init: [],
+-    /*
+-    _init:[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19],
+-    */
+-
+-    /**
+-     * The SHA-256 hash key, to be precomputed.
+-     * @private
+-     */
+-    _key: [],
+-    /*
+-    _key:
+-      [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+-       0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+-       0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+-       0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+-       0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+-       0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+-       0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+-       0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2],
+-    */
+-
+-
+-    /**
+-     * Function to precompute _init and _key.
+-     * @private
+-     */
+-    _precompute: function () {
+-        var i = 0, prime = 2, factor, isPrime;
+-
+-        function frac(x) { return (x - Math.floor(x)) * 0x100000000 | 0; }
+-
+-        for (; i < 64; prime++) {
+-            isPrime = true;
+-            for (factor = 2; factor * factor <= prime; factor++) {
+-                if (prime % factor === 0) {
+-                    isPrime = false;
+-                    break;
+-                }
+-            }
+-            if (isPrime) {
+-                if (i < 8) {
+-                    this._init[i] = frac(Math.pow(prime, 1 / 2));
+-                }
+-                this._key[i] = frac(Math.pow(prime, 1 / 3));
+-                i++;
+-            }
+-        }
+-    },
+-
+-    /**
+-     * Perform one cycle of SHA-256.
+-     * @param {Uint32Array|bitArray} w one block of words.
+-     * @private
+-     */
+-    _block: function (w) {
+-        var i, tmp, a, b,
+-            h = this._h,
+-            k = this._key,
+-            h0 = h[0], h1 = h[1], h2 = h[2], h3 = h[3],
+-            h4 = h[4], h5 = h[5], h6 = h[6], h7 = h[7];
+-
+-        /* Rationale for placement of |0 :
+-         * If a value can overflow is original 32 bits by a factor of more than a few
+-         * million (2^23 ish), there is a possibility that it might overflow the
+-         * 53-bit mantissa and lose precision.
+-         *
+-         * To avoid this, we clamp back to 32 bits by |'ing with 0 on any value that
+-         * propagates around the loop, and on the hash state h[].  I don't believe
+-         * that the clamps on h4 and on h0 are strictly necessary, but it's close
+-         * (for h4 anyway), and better safe than sorry.
+-         *
+-         * The clamps on h[] are necessary for the output to be correct even in the
+-         * common case and for short inputs.
+-         */
+-        for (i = 0; i < 64; i++) {
+-            // load up the input word for this round
+-            if (i < 16) {
+-                tmp = w[i];
+-            } else {
+-                a = w[(i + 1) & 15];
+-                b = w[(i + 14) & 15];
+-                tmp = w[i & 15] = ((a >>> 7 ^ a >>> 18 ^ a >>> 3 ^ a << 25 ^ a << 14) +
+-                    (b >>> 17 ^ b >>> 19 ^ b >>> 10 ^ b << 15 ^ b << 13) +
+-                    w[i & 15] + w[(i + 9) & 15]) | 0;
+-            }
+-
+-            tmp = (tmp + h7 + (h4 >>> 6 ^ h4 >>> 11 ^ h4 >>> 25 ^ h4 << 26 ^ h4 << 21 ^ h4 << 7) + (h6 ^ h4 & (h5 ^ h6)) + k[i]); // | 0;
+-
+-            // shift register
+-            h7 = h6; h6 = h5; h5 = h4;
+-            h4 = h3 + tmp | 0;
+-            h3 = h2; h2 = h1; h1 = h0;
+-
+-            h0 = (tmp + ((h1 & h2) ^ (h3 & (h1 ^ h2))) + (h1 >>> 2 ^ h1 >>> 13 ^ h1 >>> 22 ^ h1 << 30 ^ h1 << 19 ^ h1 << 10)) | 0;
+-        }
+-
+-        h[0] = h[0] + h0 | 0;
+-        h[1] = h[1] + h1 | 0;
+-        h[2] = h[2] + h2 | 0;
+-        h[3] = h[3] + h3 | 0;
+-        h[4] = h[4] + h4 | 0;
+-        h[5] = h[5] + h5 | 0;
+-        h[6] = h[6] + h6 | 0;
+-        h[7] = h[7] + h7 | 0;
+-    }
+-};
+-
+-/** @fileOverview Random number generator.
+- *
+- * @author Emily Stark
+- * @author Mike Hamburg
+- * @author Dan Boneh
+- * @author Michael Brooks
+- * @author Steve Thomas
+- */
+-
+-/** 
+- * @class Random number generator
+- * @description
+- * <b>Use sjcl.random as a singleton for this class!</b>
+- * <p>
+- * This random number generator is a derivative of Ferguson and Schneier's
+- * generator Fortuna.  It collects entropy from various events into several
+- * pools, implemented by streaming SHA-256 instances.  It differs from
+- * ordinary Fortuna in a few ways, though.
+- * </p>
+- *
+- * <p>
+- * Most importantly, it has an entropy estimator.  This is present because
+- * there is a strong conflict here between making the generator available
+- * as soon as possible, and making sure that it doesn't "run on empty".
+- * In Fortuna, there is a saved state file, and the system is likely to have
+- * time to warm up.
+- * </p>
+- *
+- * <p>
+- * Second, because users are unlikely to stay on the page for very long,
+- * and to speed startup time, the number of pools increases logarithmically:
+- * a new pool is created when the previous one is actually used for a reseed.
+- * This gives the same asymptotic guarantees as Fortuna, but gives more
+- * entropy to early reseeds.
+- * </p>
+- *
+- * <p>
+- * The entire mechanism here feels pretty klunky.  Furthermore, there are
+- * several improvements that should be made, including support for
+- * dedicated cryptographic functions that may be present in some browsers;
+- * state files in local storage; cookies containing randomness; etc.  So
+- * look for improvements in future versions.
+- * </p>
+- * @constructor
+- */
+-sjcl.prng = function (defaultParanoia) {
+-
+-    /* private */
+-    this._pools = [new sjcl.hash.sha256()];
+-    this._poolEntropy = [0];
+-    this._reseedCount = 0;
+-    this._robins = {};
+-    this._eventId = 0;
+-
+-    this._collectorIds = {};
+-    this._collectorIdNext = 0;
+-
+-    this._strength = 0;
+-    this._poolStrength = 0;
+-    this._nextReseed = 0;
+-    this._key = [0, 0, 0, 0, 0, 0, 0, 0];
+-    this._counter = [0, 0, 0, 0];
+-    this._cipher = undefined;
+-    this._defaultParanoia = defaultParanoia;
+-
+-    /* event listener stuff */
+-    this._collectorsStarted = false;
+-    this._callbacks = { progress: {}, seeded: {} };
+-    this._callbackI = 0;
+-
+-    /* constants */
+-    this._NOT_READY = 0;
+-    this._READY = 1;
+-    this._REQUIRES_RESEED = 2;
+-
+-    this._MAX_WORDS_PER_BURST = 65536;
+-    this._PARANOIA_LEVELS = [0, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
+-    this._MILLISECONDS_PER_RESEED = 30000;
+-    this._BITS_PER_RESEED = 80;
+-};
+-
+-sjcl.prng.prototype = {
+-    /** Generate several random words, and return them in an array.
+-     * A word consists of 32 bits (4 bytes)
+-     * @param {Number} nwords The number of words to generate.
+-     */
+-    randomWords: function (nwords, paranoia) {
+-        var out = [], i, readiness = this.isReady(paranoia), g;
+-
+-        if (readiness === this._NOT_READY) {
+-            throw new sjcl.exception.notReady("generator isn't seeded");
+-        } else if (readiness & this._REQUIRES_RESEED) {
+-            this._reseedFromPools(!(readiness & this._READY));
+-        }
+-
+-        for (i = 0; i < nwords; i += 4) {
+-            if ((i + 1) % this._MAX_WORDS_PER_BURST === 0) {
+-                this._gate();
+-            }
+-
+-            g = this._gen4words();
+-            out.push(g[0], g[1], g[2], g[3]);
+-        }
+-        this._gate();
+-
+-        return out.slice(0, nwords);
+-    },
+-
+-    setDefaultParanoia: function (paranoia, allowZeroParanoia) {
+-        if (paranoia === 0 && allowZeroParanoia !== "Setting paranoia=0 will ruin your security; use it only for testing") {
+-            throw new sjcl.exception.invalid("Setting paranoia=0 will ruin your security; use it only for testing");
+-        }
+-
+-        this._defaultParanoia = paranoia;
+-    },
+-
+-    /**
+-     * Add entropy to the pools.
+-     * @param data The entropic value.  Should be a 32-bit integer, array of 32-bit integers, or string
+-     * @param {Number} estimatedEntropy The estimated entropy of data, in bits
+-     * @param {String} source The source of the entropy, eg "mouse"
+-     */
+-    addEntropy: function (data, estimatedEntropy, source) {
+-        source = source || "user";
+-
+-        var id,
+-            i, tmp,
+-            t = (new Date()).valueOf(),
+-            robin = this._robins[source],
+-            oldReady = this.isReady(), err = 0, objName;
+-
+-        id = this._collectorIds[source];
+-        if (id === undefined) { id = this._collectorIds[source] = this._collectorIdNext++; }
+-
+-        if (robin === undefined) { robin = this._robins[source] = 0; }
+-        this._robins[source] = (this._robins[source] + 1) % this._pools.length;
+-
+-        switch (typeof (data)) {
+-
+-            case "number":
+-                if (estimatedEntropy === undefined) {
+-                    estimatedEntropy = 1;
+-                }
+-                this._pools[robin].update([id, this._eventId++, 1, estimatedEntropy, t, 1, data | 0]);
+-                break;
+-
+-            case "object":
+-                objName = Object.prototype.toString.call(data);
+-                if (objName === "[object Uint32Array]") {
+-                    tmp = [];
+-                    for (i = 0; i < data.length; i++) {
+-                        tmp.push(data[i]);
+-                    }
+-                    data = tmp;
+-                } else {
+-                    if (objName !== "[object Array]") {
+-                        err = 1;
+-                    }
+-                    for (i = 0; i < data.length && !err; i++) {
+-                        if (typeof (data[i]) !== "number") {
+-                            err = 1;
+-                        }
+-                    }
+-                }
+-                if (!err) {
+-                    if (estimatedEntropy === undefined) {
+-                        /* horrible entropy estimator */
+-                        estimatedEntropy = 0;
+-                        for (i = 0; i < data.length; i++) {
+-                            tmp = data[i];
+-                            while (tmp > 0) {
+-                                estimatedEntropy++;
+-                                tmp = tmp >>> 1;
+-                            }
+-                        }
+-                    }
+-                    this._pools[robin].update([id, this._eventId++, 2, estimatedEntropy, t, data.length].concat(data));
+-                }
+-                break;
+-
+-            case "string":
+-                if (estimatedEntropy === undefined) {
+-                    /* English text has just over 1 bit per character of entropy.
+-                     * But this might be HTML or something, and have far less
+-                     * entropy than English...  Oh well, let's just say one bit.
+-                     */
+-                    estimatedEntropy = data.length;
+-                }
+-                this._pools[robin].update([id, this._eventId++, 3, estimatedEntropy, t, data.length]);
+-                this._pools[robin].update(data);
+-                break;
+-
+-            default:
+-                err = 1;
+-        }
+-        if (err) {
+-            throw new sjcl.exception.bug("random: addEntropy only supports number, array of numbers or string");
+-        }
+-
+-        /* record the new strength */
+-        this._poolEntropy[robin] += estimatedEntropy;
+-        this._poolStrength += estimatedEntropy;
+-
+-        /* fire off events */
+-        if (oldReady === this._NOT_READY) {
+-            if (this.isReady() !== this._NOT_READY) {
+-                this._fireEvent("seeded", Math.max(this._strength, this._poolStrength));
+-            }
+-            this._fireEvent("progress", this.getProgress());
+-        }
+-    },
+-
+-    /** Is the generator ready? */
+-    isReady: function (paranoia) {
+-        var entropyRequired = this._PARANOIA_LEVELS[(paranoia !== undefined) ? paranoia : this._defaultParanoia];
+-
+-        if (this._strength && this._strength >= entropyRequired) {
+-            return (this._poolEntropy[0] > this._BITS_PER_RESEED && (new Date()).valueOf() > this._nextReseed) ?
+-                this._REQUIRES_RESEED | this._READY :
+-                this._READY;
+-        } else {
+-            return (this._poolStrength >= entropyRequired) ?
+-                this._REQUIRES_RESEED | this._NOT_READY :
+-                this._NOT_READY;
+-        }
+-    },
+-
+-    /** Get the generator's progress toward readiness, as a fraction */
+-    getProgress: function (paranoia) {
+-        var entropyRequired = this._PARANOIA_LEVELS[paranoia ? paranoia : this._defaultParanoia];
+-
+-        if (this._strength >= entropyRequired) {
+-            return 1.0;
+-        } else {
+-            return (this._poolStrength > entropyRequired) ?
+-                1.0 :
+-                this._poolStrength / entropyRequired;
+-        }
+-    },
+-
+-    /** start the built-in entropy collectors */
+-    startCollectors: function () {
+-        if (this._collectorsStarted) { return; }
+-
+-        this._eventListener = {
+-            loadTimeCollector: this._bind(this._loadTimeCollector),
+-            mouseCollector: this._bind(this._mouseCollector),
+-            keyboardCollector: this._bind(this._keyboardCollector),
+-            accelerometerCollector: this._bind(this._accelerometerCollector),
+-            touchCollector: this._bind(this._touchCollector)
+-        };
+-
+-        if (window.addEventListener) {
+-            window.addEventListener("load", this._eventListener.loadTimeCollector, false);
+-            window.addEventListener("mousemove", this._eventListener.mouseCollector, false);
+-            window.addEventListener("keypress", this._eventListener.keyboardCollector, false);
+-            window.addEventListener("devicemotion", this._eventListener.accelerometerCollector, false);
+-            window.addEventListener("touchmove", this._eventListener.touchCollector, false);
+-        } else if (document.attachEvent) {
+-            document.attachEvent("onload", this._eventListener.loadTimeCollector);
+-            document.attachEvent("onmousemove", this._eventListener.mouseCollector);
+-            document.attachEvent("keypress", this._eventListener.keyboardCollector);
+-        } else {
+-            throw new sjcl.exception.bug("can't attach event");
+-        }
+-
+-        this._collectorsStarted = true;
+-    },
+-
+-    /** stop the built-in entropy collectors */
+-    stopCollectors: function () {
+-        if (!this._collectorsStarted) { return; }
+-
+-        if (window.removeEventListener) {
+-            window.removeEventListener("load", this._eventListener.loadTimeCollector, false);
+-            window.removeEventListener("mousemove", this._eventListener.mouseCollector, false);
+-            window.removeEventListener("keypress", this._eventListener.keyboardCollector, false);
+-            window.removeEventListener("devicemotion", this._eventListener.accelerometerCollector, false);
+-            window.removeEventListener("touchmove", this._eventListener.touchCollector, false);
+-        } else if (document.detachEvent) {
+-            document.detachEvent("onload", this._eventListener.loadTimeCollector);
+-            document.detachEvent("onmousemove", this._eventListener.mouseCollector);
+-            document.detachEvent("keypress", this._eventListener.keyboardCollector);
+-        }
+-
+-        this._collectorsStarted = false;
+-    },
+-
+-    /* use a cookie to store entropy.
+-    useCookie: function (all_cookies) {
+-        throw new sjcl.exception.bug("random: useCookie is unimplemented");
+-    },*/
+-
+-    /** add an event listener for progress or seeded-ness. */
+-    addEventListener: function (name, callback) {
+-        this._callbacks[name][this._callbackI++] = callback;
+-    },
+-
+-    /** remove an event listener for progress or seeded-ness */
+-    removeEventListener: function (name, cb) {
+-        var i, j, cbs = this._callbacks[name], jsTemp = [];
+-
+-        /* I'm not sure if this is necessary; in C++, iterating over a
+-         * collection and modifying it at the same time is a no-no.
+-         */
+-
+-        for (j in cbs) {
+-            if (cbs.hasOwnProperty(j) && cbs[j] === cb) {
+-                jsTemp.push(j);
+-            }
+-        }
+-
+-        for (i = 0; i < jsTemp.length; i++) {
+-            j = jsTemp[i];
+-            delete cbs[j];
+-        }
+-    },
+-
+-    _bind: function (func) {
+-        var that = this;
+-        return function () {
+-            func.apply(that, arguments);
+-        };
+-    },
+-
+-    /** Generate 4 random words, no reseed, no gate.
+-     * @private
+-     */
+-    _gen4words: function () {
+-        for (var i = 0; i < 4; i++) {
+-            this._counter[i] = this._counter[i] + 1 | 0;
+-            if (this._counter[i]) { break; }
+-        }
+-        return this._cipher.encrypt(this._counter);
+-    },
+-
+-    /* Rekey the AES instance with itself after a request, or every _MAX_WORDS_PER_BURST words.
+-     * @private
+-     */
+-    _gate: function () {
+-        this._key = this._gen4words().concat(this._gen4words());
+-        this._cipher = new sjcl.cipher.aes(this._key);
+-    },
+-
+-    /** Reseed the generator with the given words
+-     * @private
+-     */
+-    _reseed: function (seedWords) {
+-        this._key = sjcl.hash.sha256.hash(this._key.concat(seedWords));
+-        this._cipher = new sjcl.cipher.aes(this._key);
+-        for (var i = 0; i < 4; i++) {
+-            this._counter[i] = this._counter[i] + 1 | 0;
+-            if (this._counter[i]) { break; }
+-        }
+-    },
+-
+-    /** reseed the data from the entropy pools
+-     * @param full If set, use all the entropy pools in the reseed.
+-     */
+-    _reseedFromPools: function (full) {
+-        var reseedData = [], strength = 0, i;
+-
+-        this._nextReseed = reseedData[0] =
+-            (new Date()).valueOf() + this._MILLISECONDS_PER_RESEED;
+-
+-        for (i = 0; i < 16; i++) {
+-            /* On some browsers, this is cryptographically random.  So we might
+-             * as well toss it in the pot and stir...
+-             */
+-            reseedData.push(Math.random() * 0x100000000 | 0);
+-        }
+-
+-        for (i = 0; i < this._pools.length; i++) {
+-            reseedData = reseedData.concat(this._pools[i].finalize());
+-            strength += this._poolEntropy[i];
+-            this._poolEntropy[i] = 0;
+-
+-            if (!full && (this._reseedCount & (1 << i))) { break; }
+-        }
+-
+-        /* if we used the last pool, push a new one onto the stack */
+-        if (this._reseedCount >= 1 << this._pools.length) {
+-            this._pools.push(new sjcl.hash.sha256());
+-            this._poolEntropy.push(0);
+-        }
+-
+-        /* how strong was this reseed? */
+-        this._poolStrength -= strength;
+-        if (strength > this._strength) {
+-            this._strength = strength;
+-        }
+-
+-        this._reseedCount++;
+-        this._reseed(reseedData);
+-    },
+-
+-    _keyboardCollector: function () {
+-        this._addCurrentTimeToEntropy(1);
+-    },
+-
+-    _mouseCollector: function (ev) {
+-        var x, y;
+-
+-        try {
+-            x = ev.x || ev.clientX || ev.offsetX || 0;
+-            y = ev.y || ev.clientY || ev.offsetY || 0;
+-        } catch (err) {
+-            // Event originated from a secure element. No mouse position available.
+-            x = 0;
+-            y = 0;
+-        }
+-
+-        if (x != 0 && y != 0) {
+-            this.addEntropy([x, y], 2, "mouse");
+-        }
+-
+-        this._addCurrentTimeToEntropy(0);
+-    },
+-
+-    _touchCollector: function (ev) {
+-        var touch = ev.touches[0] || ev.changedTouches[0];
+-        var x = touch.pageX || touch.clientX,
+-            y = touch.pageY || touch.clientY;
+-
+-        this.addEntropy([x, y], 1, "touch");
+-
+-        this._addCurrentTimeToEntropy(0);
+-    },
+-
+-    _loadTimeCollector: function () {
+-        this._addCurrentTimeToEntropy(2);
+-    },
+-
+-    _addCurrentTimeToEntropy: function (estimatedEntropy) {
+-        if (typeof window !== 'undefined' && window.performance && typeof window.performance.now === "function") {
+-            //how much entropy do we want to add here?
+-            this.addEntropy(window.performance.now(), estimatedEntropy, "loadtime");
+-        } else {
+-            this.addEntropy((new Date()).valueOf(), estimatedEntropy, "loadtime");
+-        }
+-    },
+-    _accelerometerCollector: function (ev) {
+-        var ac = ev.accelerationIncludingGravity.x || ev.accelerationIncludingGravity.y || ev.accelerationIncludingGravity.z;
+-        if (window.orientation) {
+-            var or = window.orientation;
+-            if (typeof or === "number") {
+-                this.addEntropy(or, 1, "accelerometer");
+-            }
+-        }
+-        if (ac) {
+-            this.addEntropy(ac, 2, "accelerometer");
+-        }
+-        this._addCurrentTimeToEntropy(0);
+-    },
+-
+-    _fireEvent: function (name, arg) {
+-        var j, cbs = sjcl.random._callbacks[name], cbsTemp = [];
+-        /* TODO: there is a race condition between removing collectors and firing them */
+-
+-        /* I'm not sure if this is necessary; in C++, iterating over a
+-         * collection and modifying it at the same time is a no-no.
+-         */
+-
+-        for (j in cbs) {
+-            if (cbs.hasOwnProperty(j)) {
+-                cbsTemp.push(cbs[j]);
+-            }
+-        }
+-
+-        for (j = 0; j < cbsTemp.length; j++) {
+-            cbsTemp[j](arg);
+-        }
+-    }
+-};
+-
+-/** an instance for the prng.
+-* @see sjcl.prng
+-*/
+-sjcl.random = new sjcl.prng(6);
+-
+-(function () {
+-    // function for getting nodejs crypto module. catches and ignores errors.
+-    function getCryptoModule() {
+-        try {
+-            return require('crypto');
+-        }
+-        catch (e) {
+-            return null;
+-        }
+-    }
+-
+-    try {
+-        var buf, crypt, ab;
+-
+-        // get cryptographically strong entropy depending on runtime environment
+-        if (typeof module !== 'undefined' && module.exports && (crypt = getCryptoModule()) && crypt.randomBytes) {
+-            buf = crypt.randomBytes(1024 / 8);
+-            buf = new Uint32Array(new Uint8Array(buf).buffer);
+-            sjcl.random.addEntropy(buf, 1024, "crypto.randomBytes");
+-
+-        } else if (typeof window !== 'undefined' && typeof Uint32Array !== 'undefined') {
+-            ab = new Uint32Array(32);
+-            if (window.crypto && window.crypto.getRandomValues) {
+-                window.crypto.getRandomValues(ab);
+-            } else if (window.msCrypto && window.msCrypto.getRandomValues) {
+-                window.msCrypto.getRandomValues(ab);
+-            } else {
+-                return;
+-            }
+-
+-            // get cryptographically strong entropy in Webkit
+-            sjcl.random.addEntropy(ab, 1024, "crypto.getRandomValues");
+-
+-        } else {
+-            // no getRandomValues :-(
+-        }
+-    } catch (e) {
+-        if (typeof window !== 'undefined' && window.console) {
+-            console.log("There was an error collecting entropy from the browser:");
+-            console.log(e);
+-            //we do not want the library to fail due to randomness not being maintained.
+-        }
+-    }
+-}());
+-
+ /** @fileOverview Low-level AES implementation.
+  *
+  * This file contains a low-level implementation of AES, optimized for
+@@ -1662,6 +866,98 @@ sjcl.misc.pbkdf2 = function (password, salt, count, length, Prff) {
+     return out;
+ };
+ 
++/**
++ * Random values
++ * @namespace
++ */
++sjcl.random = {
++    /**
++     * Generate cryptographically strong random words using native crypto module if it exists.
++     * 
++     * In react-native or other non native crypto environment, user could define a crypto module from gloabl variable.
++     * 
++     * If the crypto module doesn't exist, then using pure js implementation function.
++     * 
++     * @param {Number} nbytes The number of bytes to generate.
++     * @return {bitArray} The random words.
++     */
++    randomWords: function (nbytes) {
++        function getCryptoModule() {
++            try {
++                return require('crypto');
++            }
++            catch (e) {
++                return null;
++            }
++        }
++
++        var crypto;
++        if (typeof window !== 'undefined') {
++            // Native crypto from window (Browser)
++            if (window.crypto) {
++                crypto = window.crypto;
++            }else if(window.msCrypto) {
++                crypto = window.msCrypto;
++            }
++        } else if (typeof module !== 'undefined' && module.exports) {
++            // Native crypto import from NodeJS
++            crypto = getCryptoModule();
++        } else if (typeof global !== 'undefined' && global.crypto) {
++            // Native crypto from global variable
++            crypto = global.crypto;
++        }
++
++        // get cryptographically strong random values depending on runtime environment
++        try {
++            if (crypto) {
++                if (crypto.getRandomValues) {
++                    return sjcl.codec.bytes.toBits(crypto.getRandomValues(new Uint8Array(nbytes)));
++                }
++                if (crypto.randomBytes) {
++                    return sjcl.codec.bytes.toBits(new Uint8Array(crypto.randomBytes(nbytes)));
++                }
++            } else {
++                return getRandomValues(nbytes);
++            }
++        } catch (e) {
++            return getRandomValues(nbytes);
++        }
++    },
++
++    
++    /** 
++     * Generate random words with pure js, cryptographically not as strong & safe as native implementation.
++     * @param {Number} nbytes The number of bytes to generate.
++     * @return {bitArray} The random words.
++     */
++    getRandomValues: function (nbytes) {
++        var words = [];
++
++        var r = function (m_w) {
++            var m_w = m_w;
++            var m_z = 0x3ade68b1;
++            var mask = 0xffffffff;
++
++            return function () {
++                m_z = (0x9069 * (m_z & 0xFFFF) + (m_z >> 0x10)) & mask;
++                m_w = (0x4650 * (m_w & 0xFFFF) + (m_w >> 0x10)) & mask;
++                var result = ((m_z << 0x10) + m_w) & mask;
++                result /= 0x100000000;
++                result += 0.5;
++                return result * (Math.random() > .5 ? 1 : -1);
++            }
++        };
++
++        for (var i = 0, rcache; i < nbytes; i += 4) {
++            var _r = r((rcache || Math.random()) * 0x100000000);
++            rcache = _r() * 0x3ade67b7;
++            words.push((_r() * 0x100000000) | 0);
++        }
++
++        return words
++    }
++}
++
+ /** @fileOverview CTR mode implementation.
+  *
+  * Special thanks to Roy Nicholson for pointing out a bug in our
+
+From 82e13c4273a3b6125acfbb11fdb6f115bd4c2e5a Mon Sep 17 00:00:00 2001
+From: xqdoo00o <xqdoo00o@gmail.com>
+Date: Wed, 12 Aug 2020 00:23:00 +0800
+Subject: [PATCH 5/7] less aesworker code
+
+---
+ lib/aes.js  | 156 +++++++++++++++++++---------------------------------
+ lib/sjcl.js |   1 -
+ 2 files changed, 56 insertions(+), 101 deletions(-)
+
+diff --git a/lib/aes.js b/lib/aes.js
+index 77bc46c..356b986 100644
+--- a/lib/aes.js
++++ b/lib/aes.js
+@@ -7,41 +7,50 @@ var passwordVerifierLen = 2;
+ var authCodeLen = 10;
+ 
+ /**
+- * Create a worker that uses sjcl to encrypt data.
++ * Create a worker that uses sjcl to process file data.
+  * @constructor
+- * @param {Object} options the options to use when encrypting.
++ * @param dir The direction, 0 for decrypt and 1 for encrypt.
++ * @param {Object|bitArray} param the aesKey for decrypt or the options for encrypt.
+  */
+-function EncryptWorker(options) {
+-    GenericWorker.call(this, "EncryptWorker");
+-
+-    this._password = options.password;
+-    this._keyLen = this._macLen = 8 * options.strength + 8;
+-    this._saltLen = this._keyLen /2;
++function AesWorker(dir, param) {
++    GenericWorker.call(this, "AesWorker");
+ 
+     this._aes = null;
++    this._aesKey = null;
+     this._mac = null;
++    this._dir = dir;
++
++    if (this._dir) {
++        this._password = param.password;
++        this._keyLen = this._macLen = 8 * param.strength + 8;
++        this._saltLen = this._keyLen /2;
++    } else {
++        this._aesKey = param;
++    }    
+ 
+     // the `meta` object from the last chunk received
+     // this allow this worker to pass around metadata
+     this.meta = {};
+ }
+ 
+-utils.inherits(EncryptWorker, GenericWorker);
++utils.inherits(AesWorker, GenericWorker);
+ 
+ /**
+  * @see GenericWorker.processChunk
+  */
+-EncryptWorker.prototype.processChunk = function (chunk) {
++AesWorker.prototype.processChunk = function (chunk) {
+     this.meta = chunk.meta;
+ 
+     if (this._aes === null) {
+         this._createAes();
+     }
+-    var encryptedData = this._aes.update(sjcl.codec.bytes.toBits(chunk.data));
+-    this._mac.update(encryptedData);
++    var result = this._aes.update(sjcl.codec.bytes.toBits(chunk.data));
++    if (this._dir) {
++        this._mac.update(result);
++    }
+ 
+     this.push({
+-        data : new Uint8Array(sjcl.codec.bytes.fromBits(encryptedData)),
++        data : new Uint8Array(sjcl.codec.bytes.fromBits(result)),
+         meta : this.meta
+     });
+ };
+@@ -49,117 +58,64 @@ EncryptWorker.prototype.processChunk = function (chunk) {
+ /**
+  * @see GenericWorker.flush
+  */
+-EncryptWorker.prototype.flush = function () {
++AesWorker.prototype.flush = function () {
+     GenericWorker.prototype.flush.call(this);
+ 
+-    if (this._aes === null) {
+-        this._createAes();
++    if (this._dir) {
++        if (this._aes === null) {
++            this._createAes();
++        }
++        var macData = this._mac.digest();
++        macData = sjcl.bitArray.clamp(macData, authCodeLen * 8);
++    
++        this.push({
++            data : new Uint8Array(sjcl.codec.bytes.fromBits(macData)),
++            meta : {percent: 100}
++        });
+     }
+-    var macData = this._mac.digest();
+-    macData = sjcl.bitArray.clamp(macData, authCodeLen * 8);
+-
+-    this.push({
+-        data : new Uint8Array(sjcl.codec.bytes.fromBits(macData)),
+-        meta : {percent: 100}
+-    });
+ };
+ 
+ /**
+  * @see GenericWorker.cleanUp
+  */
+-EncryptWorker.prototype.cleanUp = function () {
++AesWorker.prototype.cleanUp = function () {
+     GenericWorker.prototype.cleanUp.call(this);
+     this._aes = null;
++    this._aesKey = null;
+     this._mac = null;
+ };
+ 
+ /**
+  * Create the _aes object.
+  */
+-EncryptWorker.prototype._createAes = function () {
+-    var salt = sjcl.random.randomWords(this._saltLen);
+-    var derivedKey = sjcl.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
+-
+-    var aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
+-    this._aes = new sjcl.mode.ctrGladman(new sjcl.cipher.aes(aesKey), [0, 0, 0, 0]);
+-
+-    var macKey = sjcl.bitArray.bitSlice(derivedKey, this._keyLen * 8, (this._keyLen + this._macLen) * 8);
+-    this._mac = new sjcl.misc.hmac(macKey);
+-
+-    var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (this._keyLen + this._macLen) * 8);
+-    this.push({
+-        data : new Uint8Array(sjcl.codec.bytes.fromBits(sjcl.bitArray.concat(salt, derivedPassVerifier))),
+-        meta : {percent: 0}
+-    });
+-};
+-
+-/**
+- * Create a worker that uses sjcl to decrypt data.
+- * @constructor
+- * @param {bitArray} key the key of AES.
+- */
+-function DecryptWorker(key) {
+-    GenericWorker.call(this, "DecryptWorker");
+-    
+-    this._aes = null;
+-    this._aesKey = key;
+-
+-    // the `meta` object from the last chunk received
+-    // this allow this worker to pass around metadata
+-    this.meta = {};
+-}
+-
+-utils.inherits(DecryptWorker, GenericWorker);
+-
+-/**
+- * @see GenericWorker.processChunk
+- */
+-DecryptWorker.prototype.processChunk = function (chunk) {
+-    this.meta = chunk.meta;
+-
+-    if (this._aes === null) {
+-        this._createAes();
++AesWorker.prototype._createAes = function () {
++    if (this._dir) {
++        var salt = sjcl.random.randomWords(this._saltLen);
++        var derivedKey = sjcl.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
++        this._aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
++        var macKey = sjcl.bitArray.bitSlice(derivedKey, this._keyLen * 8, (this._keyLen + this._macLen) * 8);
++        var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (this._keyLen + this._macLen) * 8);
++        this._mac = new sjcl.misc.hmac(macKey);
++        
++        this.push({
++            data : new Uint8Array(sjcl.codec.bytes.fromBits(sjcl.bitArray.concat(salt, derivedPassVerifier))),
++            meta : {percent: 0}
++        });
+     }
+-
+-    var decryptedData = this._aes.update(sjcl.codec.bytes.toBits(chunk.data));
+-    this.push({
+-        data : new Uint8Array(sjcl.codec.bytes.fromBits(decryptedData)),
+-        meta : this.meta
+-    });
+-};
+-
+-/**
+- * @see GenericWorker.flush
+- */
+-DecryptWorker.prototype.flush = function () {
+-    GenericWorker.prototype.flush.call(this);
+-};
+-
+-/**
+- * @see GenericWorker.cleanUp
+- */
+-DecryptWorker.prototype.cleanUp = function () {
+-    GenericWorker.prototype.cleanUp.call(this);
+-    this._aes = null;
+-};
+-
+-/**
+- * create the _aes object. 
+- */
+-DecryptWorker.prototype._createAes = function () {
++    
+     this._aes = new sjcl.mode.ctrGladman(new sjcl.cipher.aes(this._aesKey), [0, 0, 0, 0]);
+ };
+ 
+ exports.EncryptWorker = function (options) {
+-    return new EncryptWorker(options);
++    return new AesWorker(1, options);
+ };
+ 
+ exports.DecryptWorker = function (key) {
+-    return new DecryptWorker(key);
++    return new AesWorker(0, key);
+ };
+ 
+ /**
+- * Verify the password using sjcl.
++ * Verify the password of file using sjcl.
+  * @param {Uint8Array} data the data to verify.
+  * @param {Object} options the options when verifying.
+  * @return {Object} the aes key and encrypted file data.
+@@ -170,16 +126,16 @@ exports.verifyPassword  = function (data, options) {
+     var macLen = keyLen;
+     var saltLen = keyLen / 2;
+ 
+-    var salt = sjcl.codec.bytes.toBits(data.slice(0, saltLen));
++    var salt = sjcl.codec.bytes.toBits(data.subarray(0, saltLen));
+     var derivedKey = sjcl.misc.pbkdf2(password, salt, 1000, (macLen + keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
+     var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (keyLen + macLen) * 8);
+-    var passVerifyValue = sjcl.codec.bytes.toBits(data.slice(saltLen, saltLen + passwordVerifierLen));
++    var passVerifyValue = sjcl.codec.bytes.toBits(data.subarray(saltLen, saltLen + passwordVerifierLen));
+     if (!sjcl.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
+         throw new Error("Encrypted zip: incorrect password");
+     }
+ 
+     return {
+         key: sjcl.bitArray.bitSlice(derivedKey, 0, keyLen * 8),
+-        data: data.slice(saltLen + passwordVerifierLen, -authCodeLen)
++        data: data.subarray(saltLen + passwordVerifierLen, -authCodeLen)
+     };
+ };
+diff --git a/lib/sjcl.js b/lib/sjcl.js
+index 553f5aa..eab83a9 100644
+--- a/lib/sjcl.js
++++ b/lib/sjcl.js
+@@ -923,7 +923,6 @@ sjcl.random = {
+             return getRandomValues(nbytes);
+         }
+     },
+-
+     
+     /** 
+      * Generate random words with pure js, cryptographically not as strong & safe as native implementation.
+
+From 6a45148ca1fd64327e413b6f725d8000a0fd5057 Mon Sep 17 00:00:00 2001
+From: xqdoo00o <xqdoo00o@gmail.com>
+Date: Wed, 12 Aug 2020 22:49:34 +0800
+Subject: [PATCH 6/7] fix crypto for web worker
+
+---
+ lib/sjcl.js | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/lib/sjcl.js b/lib/sjcl.js
+index eab83a9..2cc9d2c 100644
+--- a/lib/sjcl.js
++++ b/lib/sjcl.js
+@@ -899,6 +899,9 @@ sjcl.random = {
+             }else if(window.msCrypto) {
+                 crypto = window.msCrypto;
+             }
++        } else if (typeof self !== 'undefined' && self.crypto) {
++            // Native crypto from web worker (Browser)
++            crypto = self.crypto;
+         } else if (typeof module !== 'undefined' && module.exports) {
+             // Native crypto import from NodeJS
+             crypto = getCryptoModule();
+@@ -907,7 +910,7 @@ sjcl.random = {
+             crypto = global.crypto;
+         }
+ 
+-        // get cryptographically strong random values depending on runtime environment
++        // Get cryptographically strong random values depending on runtime environment
+         try {
+             if (crypto) {
+                 if (crypto.getRandomValues) {
+@@ -976,13 +979,13 @@ sjcl.random = {
+  * Brian Gladman's CTR Mode.
+  * @namespace
+  */
+-sjcl.mode.ctrGladman = function(prf, iv){
++sjcl.mode.ctrGladman = function(prf, iv) {
+     this._prf = prf;
+     this._initIv = iv;
+     this._iv = iv;
+ };
+ 
+-sjcl.mode.ctrGladman.prototype.reset = function (){
++sjcl.mode.ctrGladman.prototype.reset = function () {
+     this._iv = this._initIv;
+ }
+ 
+
+From 0eea9a80d3c9875089b0b9c2cd33ea8cdf212d12 Mon Sep 17 00:00:00 2001
+From: xqdoo00o <xqdoo00o@gmail.com>
+Date: Sat, 29 Aug 2020 20:49:19 +0800
+Subject: [PATCH 7/7] fix AE-2 format
+
+---
+ lib/aes.js              | 4 ++--
+ lib/compressedObject.js | 1 -
+ lib/load.js             | 4 ++++
+ 3 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/lib/aes.js b/lib/aes.js
+index 356b986..5c8e62f 100644
+--- a/lib/aes.js
++++ b/lib/aes.js
+@@ -91,7 +91,7 @@ AesWorker.prototype.cleanUp = function () {
+ AesWorker.prototype._createAes = function () {
+     if (this._dir) {
+         var salt = sjcl.random.randomWords(this._saltLen);
+-        var derivedKey = sjcl.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
++        var derivedKey = sjcl.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + passwordVerifierLen) * 8);
+         this._aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
+         var macKey = sjcl.bitArray.bitSlice(derivedKey, this._keyLen * 8, (this._keyLen + this._macLen) * 8);
+         var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (this._keyLen + this._macLen) * 8);
+@@ -127,7 +127,7 @@ exports.verifyPassword  = function (data, options) {
+     var saltLen = keyLen / 2;
+ 
+     var salt = sjcl.codec.bytes.toBits(data.subarray(0, saltLen));
+-    var derivedKey = sjcl.misc.pbkdf2(password, salt, 1000, (macLen + keyLen + passwordVerifierLen) * 8, sjcl.misc.hmac);
++    var derivedKey = sjcl.misc.pbkdf2(password, salt, 1000, (macLen + keyLen + passwordVerifierLen) * 8);
+     var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (keyLen + macLen) * 8);
+     var passVerifyValue = sjcl.codec.bytes.toBits(data.subarray(saltLen, saltLen + passwordVerifierLen));
+     if (!sjcl.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
+diff --git a/lib/compressedObject.js b/lib/compressedObject.js
+index acd23e7..d2cd0b0 100644
+--- a/lib/compressedObject.js
++++ b/lib/compressedObject.js
+@@ -81,7 +81,6 @@ CompressedObject.prototype = {
+ CompressedObject.createWorkerFrom = function (uncompressedWorker, compression, compressionOptions, encryptOptions) {
+     if (encryptOptions.password !== null) {
+         return uncompressedWorker
+-        .pipe(new Crc32Probe())
+         .pipe(new DataLengthProbe("uncompressedSize"))
+         .pipe(compression.compressWorker(compressionOptions))
+         .pipe(aes.EncryptWorker(encryptOptions))
+diff --git a/lib/load.js b/lib/load.js
+index 2974086..28da556 100644
+--- a/lib/load.js
++++ b/lib/load.js
+@@ -14,6 +14,10 @@ var nodejsUtils = require("./nodejsUtils");
+  */
+ function checkEntryCRC32(zipEntry) {
+     return new external.Promise(function (resolve, reject) {
++        if (zipEntry.options.aes.version === 2) {
++            reject(new Error("Encrypted zip : no CRC32 stored"));
++            return;
++        }
+         var worker = zipEntry.decompressed.getContentWorker().pipe(new Crc32Probe());
+         worker.on("error", function (e) {
+             reject(e);
